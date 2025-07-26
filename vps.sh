@@ -237,14 +237,12 @@ configure_fail2ban() {
     chmod 640 /var/log/auth.log
     chown root:adm /var/log/auth.log
     
-    # 配置 rsyslog 限制日志大小（针对小VPS优化）
+    # 配置 rsyslog 确保 SSH 日志正确记录
     cat > /etc/rsyslog.d/49-vps-optimize.conf << 'EOF'
-# 针对小VPS的日志优化配置
-# 限制 auth.log 大小，只记录关键信息
-:programname, isequal, "sshd" /var/log/auth.log
-& stop
+# 确保 SSH 认证日志正确记录到 auth.log
+auth,authpriv.*                 /var/log/auth.log
 
-# 减少其他不必要的日志
+# 减少其他不必要的日志（但不影响 SSH 日志）
 :msg, contains, "systemd-logind" stop
 :msg, contains, "CRON" stop
 EOF
@@ -253,46 +251,36 @@ EOF
     systemctl enable rsyslog
     systemctl restart rsyslog
     
+    # 等待 rsyslog 重启完成，确保日志文件可用
+    sleep 3
+    
+    # 生成一些初始日志内容，确保文件不为空
+    logger -p auth.info "fail2ban setup: SSH service configured"
+    
     # 下载你的自定义配置文件
     if wget -O /etc/fail2ban/jail.local https://raw.githubusercontent.com/yzj160212/vps/main/jail.local; then
         print_info "fail2ban 配置文件下载成功"
+        
+        # 验证下载的配置文件
+        if ! fail2ban-client -t 2>/dev/null; then
+            print_warning "下载的配置文件有问题，使用备用配置"
+            create_fallback_config
+        fi
     else
         print_warning "fail2ban 配置文件下载失败，使用基础配置"
-        # 创建基础的 jail.local 配置
-        cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime = 604800
-findtime = 600
-maxretry = 3
-backend = systemd
-ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-bantime = 604800
-findtime = 600
-EOF
+        create_fallback_config
     fi
     
     # 可选：明确指定SSH端口（虽然port=ssh已经足够）
     # sed -i "s/port = ssh/port = $ssh_port/" /etc/fail2ban/jail.local
     
-    # 测试 fail2ban 配置
-    print_info "测试 fail2ban 配置..."
-    if fail2ban-client -t; then
-        print_info "fail2ban 配置测试通过"
-    else
-        print_warning "fail2ban 配置测试失败，尝试修复..."
-        # 如果测试失败，使用最简配置
+    # 创建备用配置的函数
+    create_fallback_config() {
         cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
 bantime = 86400
 findtime = 600
-maxretry = 3
+maxretry = 5
 ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
@@ -300,37 +288,96 @@ enabled = true
 port = ssh
 filter = sshd
 logpath = /var/log/auth.log
-maxretry = 3
+maxretry = 5
 bantime = 86400
 findtime = 600
 EOF
-    fi
+    }
+    
+    # 最终配置验证和修复
+    print_info "验证 fail2ban 配置..."
+    local config_attempts=0
+    while [ $config_attempts -lt 3 ]; do
+        if fail2ban-client -t 2>/dev/null; then
+            print_info "fail2ban 配置验证通过"
+            break
+        else
+            config_attempts=$((config_attempts + 1))
+            print_warning "配置验证失败，尝试修复... ($config_attempts/3)"
+            
+            if [ $config_attempts -eq 1 ]; then
+                # 第一次失败：尝试使用 systemd backend
+                sed -i '/backend = systemd/d' /etc/fail2ban/jail.local
+                echo "backend = systemd" >> /etc/fail2ban/jail.local
+            elif [ $config_attempts -eq 2 ]; then
+                # 第二次失败：使用最简配置
+                create_fallback_config
+            else
+                # 第三次失败：使用 systemd journal
+                cat > /etc/fail2ban/jail.local << 'EOF'
+[DEFAULT]
+bantime = 86400
+findtime = 600
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+backend = systemd
+maxretry = 5
+bantime = 86400
+findtime = 600
+EOF
+            fi
+        fi
+    done
     
     # 启动并启用 fail2ban 服务
     systemctl enable fail2ban
+    
+    # 确保日志文件有内容后再启动
+    if [ ! -s /var/log/auth.log ]; then
+        print_info "初始化 auth.log 文件..."
+        logger -p auth.info "fail2ban: Initial log entry for SSH monitoring"
+        echo "$(date) sshd[$$]: Server listening on 0.0.0.0 port $ssh_port." >> /var/log/auth.log
+    fi
+    
+    # 启动服务
     systemctl start fail2ban
     
     # 等待服务完全启动
-    sleep 5
+    sleep 8
     
     # 验证 fail2ban 是否正常运行
     local retry_count=0
-    while [ $retry_count -lt 3 ]; do
+    while [ $retry_count -lt 5 ]; do
         if systemctl is-active --quiet fail2ban; then
             print_info "fail2ban 服务运行正常"
             
+            # 等待 jail 完全加载
+            sleep 3
+            
             # 显示 fail2ban 状态
-            print_info "fail2ban 状态:"
-            if fail2ban-client status 2>/dev/null; then
-                print_info "fail2ban 状态显示成功"
+            if fail2ban-client status 2>/dev/null | grep -q "sshd"; then
+                print_info "fail2ban SSH jail 运行正常"
+                fail2ban-client status sshd 2>/dev/null || true
             else
-                print_warning "fail2ban-client 暂时无法连接，服务正在启动中"
+                print_warning "fail2ban SSH jail 可能未正确加载"
             fi
             break
         else
             retry_count=$((retry_count + 1))
-            print_warning "fail2ban 启动中，等待重试... ($retry_count/3)"
-            sleep 3
+            print_warning "fail2ban 启动中，等待重试... ($retry_count/5)"
+            
+            # 查看启动错误
+            if [ $retry_count -eq 3 ]; then
+                print_info "检查启动错误:"
+                journalctl -u fail2ban --no-pager -l --lines=10
+            fi
+            
+            sleep 5
             systemctl restart fail2ban
         fi
     done
