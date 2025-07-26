@@ -8,6 +8,7 @@ findtime = 600          # 10分钟检测窗口
 maxretry = 3            # 3次失败就封禁
 backend = systemd
 ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+allowipv6 = auto
 
 [sshd]
 # SSH 服务监控配置
