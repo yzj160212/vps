@@ -52,7 +52,7 @@ bash <(curl -fsSL vps-yy.vercel.app)
 
 ## 使用要求
 
-- **系统要求**: Debian 12 (Bookworm)
+- **系统要求**: Debian 12
 - **权限要求**: root 用户权限
 - **网络要求**: 能够访问 GitHub 和软件源
 - **磁盘空间**: 建议至少 1GB 可用空间
