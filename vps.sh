@@ -404,35 +404,99 @@ EOF
     
     # 验证 fail2ban 是否正常运行
     local retry_count=0
-    while [ $retry_count -lt 5 ]; do
+    local max_retries=5
+    
+    while [ $retry_count -lt $max_retries ]; do
         if systemctl is-active --quiet fail2ban; then
             print_info "fail2ban 服务运行正常"
             
             # 等待 jail 完全加载
-            sleep 3
+            sleep 5
             
-            # 显示 fail2ban 状态
-            if fail2ban-client status 2>/dev/null | grep -q "sshd"; then
-                print_info "fail2ban SSH jail 运行正常"
-                fail2ban-client status sshd 2>/dev/null || true
-                safe_execute "true" "fail2ban 服务启动和启用"
-            else
-                print_warning "fail2ban SSH jail 可能未正确加载"
-                safe_execute "true" "fail2ban 服务启动和启用" "true"
+            # 验证 fail2ban 客户端连接
+            if ! fail2ban-client ping 2>/dev/null | grep -q "pong"; then
+                print_error "fail2ban 客户端连接失败"
+                print_info "fail2ban 服务日志:"
+                journalctl -u fail2ban --no-pager -l --lines=15
+                cleanup_and_exit 1
             fi
-            break
+            
+            # 显示 fail2ban 状态并验证 SSH jail
+            local fail2ban_status=$(fail2ban-client status 2>/dev/null)
+            print_info "fail2ban 整体状态:"
+            echo "$fail2ban_status"
+            
+            if echo "$fail2ban_status" | grep -q "sshd"; then
+                print_info "fail2ban SSH jail 已加载"
+                
+                # 验证 SSH jail 的详细状态
+                local ssh_jail_status=$(fail2ban-client status sshd 2>/dev/null)
+                print_info "SSH jail 详细状态:"
+                echo "$ssh_jail_status"
+                
+                # 检查关键配置项
+                if echo "$ssh_jail_status" | grep -q "Filter"; then
+                    print_info "SSH jail 过滤器配置正常"
+                else
+                    print_error "SSH jail 过滤器配置异常"
+                    cleanup_and_exit 1
+                fi
+                
+                if echo "$ssh_jail_status" | grep -q "$ssh_port"; then
+                    print_info "SSH jail 端口配置正确 ($ssh_port)"
+                else
+                    print_warning "SSH jail 端口配置可能有问题，检查配置"
+                    echo "$ssh_jail_status"
+                fi
+                
+                # 验证日志文件监控
+                if echo "$ssh_jail_status" | grep -q "/var/log/auth.log"; then
+                    print_info "SSH jail 日志文件监控正常"
+                    
+                    # 检查日志文件是否可读
+                    if [ -r /var/log/auth.log ]; then
+                        print_info "auth.log 文件可读"
+                    else
+                        print_error "auth.log 文件不可读"
+                        ls -la /var/log/auth.log
+                        cleanup_and_exit 1
+                    fi
+                else
+                    print_error "SSH jail 日志文件配置异常"
+                    cleanup_and_exit 1
+                fi
+                
+                safe_execute "true" "fail2ban 服务启动和验证"
+                break
+            else
+                print_error "fail2ban SSH jail 未正确加载"
+                print_info "可用的 jail 列表:"
+                echo "$fail2ban_status"
+                print_info "fail2ban 配置文件内容:"
+                cat /etc/fail2ban/jail.local 2>/dev/null || print_warning "无法读取 jail.local"
+                print_info "fail2ban 服务日志:"
+                journalctl -u fail2ban --no-pager -l --lines=20
+                cleanup_and_exit 1
+            fi
         else
             retry_count=$((retry_count + 1))
-            print_warning "fail2ban 启动中，等待重试... ($retry_count/5)"
+            print_warning "fail2ban 启动中，等待重试... ($retry_count/$max_retries)"
             
-            # 查看启动错误
-            if [ $retry_count -eq 3 ]; then
-                print_info "检查启动错误:"
-                journalctl -u fail2ban --no-pager -l --lines=10
+            # 显示启动错误
+            if [ $retry_count -eq 2 ]; then
+                print_info "检查 fail2ban 启动错误:"
+                journalctl -u fail2ban --no-pager -l --lines=15
+                print_info "检查 fail2ban 配置:"
+                fail2ban-client -t 2>&1 || print_warning "配置测试失败"
             fi
             
-            sleep 5
-            systemctl restart fail2ban
+            if [ $retry_count -lt $max_retries ]; then
+                print_info "尝试重新启动 fail2ban..."
+                systemctl stop fail2ban >/dev/null 2>&1
+                sleep 3
+                systemctl start fail2ban >/dev/null 2>&1
+                sleep 5
+            fi
         fi
     done
     
@@ -440,11 +504,11 @@ EOF
         print_error "fail2ban 服务启动失败"
         print_info "尝试查看服务日志:"
         journalctl -u fail2ban --no-pager -l --lines=20
-        print_warning "继续执行脚本，但 fail2ban 保护可能不可用"
-        return 1
+        print_error "fail2ban 是关键安全组件，脚本无法继续"
+        cleanup_and_exit 1
     fi
     
-    # 确保函数返回成功状态
+    print_info "fail2ban 服务验证通过"
     return 0
 }
 
@@ -592,8 +656,21 @@ configure_firewall() {
     # 确保 UFW 已安装
     if ! command -v ufw >/dev/null 2>&1; then
         safe_execute "apt install ufw -y" "UFW 安装"
+        
+        # 验证安装是否成功
+        if ! command -v ufw >/dev/null 2>&1; then
+            print_error "UFW 安装验证失败"
+            cleanup_and_exit 1
+        fi
+        print_info "UFW 安装验证通过"
     else
         print_info "UFW 已安装"
+    fi
+    
+    # 检查 UFW 服务状态
+    if ! systemctl is-enabled ufw >/dev/null 2>&1; then
+        print_info "启用 UFW 服务..."
+        systemctl enable ufw >/dev/null 2>&1
     fi
     
     # 重置防火墙规则
@@ -613,14 +690,64 @@ configure_firewall() {
     # 启用 UFW（非交互式）
     safe_execute "echo 'y' | ufw enable" "UFW 启用"
     
+    # 等待防火墙规则生效
+    sleep 2
+    
     # 验证防火墙状态
-    if ufw status | grep -q "Status: active"; then
+    print_info "验证防火墙状态..."
+    local ufw_status=$(ufw status 2>/dev/null)
+    
+    if echo "$ufw_status" | grep -q "Status: active"; then
         print_info "防火墙已成功启用"
-        # 显示防火墙规则
-        print_info "防火墙规则:"
-        ufw status numbered
+        
+        # 验证关键规则是否存在
+        local rules_ok=true
+        
+        if ! echo "$ufw_status" | grep -q "$ssh_port/tcp"; then
+            print_error "SSH 端口 $ssh_port 规则未生效"
+            rules_ok=false
+        fi
+        
+        if ! echo "$ufw_status" | grep -q "80/tcp"; then
+            print_error "HTTP 端口 80 规则未生效"
+            rules_ok=false
+        fi
+        
+        if ! echo "$ufw_status" | grep -q "443/tcp"; then
+            print_error "HTTPS 端口 443 规则未生效"
+            rules_ok=false
+        fi
+        
+        if [ "$rules_ok" = true ]; then
+            print_info "防火墙规则验证通过"
+            # 显示防火墙规则
+            print_info "当前防火墙规则:"
+            ufw status numbered
+            
+            # 验证 iptables 规则是否真正生效
+            if iptables -L ufw-user-input 2>/dev/null | grep -q "$ssh_port"; then
+                print_info "iptables 规则验证通过"
+            else
+                print_warning "iptables 规则可能未完全生效，但 UFW 状态正常"
+            fi
+            
+            safe_execute "true" "防火墙配置和验证完成"
+        else
+            print_error "防火墙规则验证失败"
+            print_info "当前防火墙状态:"
+            echo "$ufw_status"
+            print_info "iptables 规则:"
+            iptables -L -n | head -20
+            cleanup_and_exit 1
+        fi
     else
         print_error "防火墙启用验证失败"
+        print_info "UFW 状态输出:"
+        echo "$ufw_status"
+        print_info "UFW 服务状态:"
+        systemctl status ufw --no-pager -l | head -10
+        print_info "检查系统日志:"
+        journalctl -u ufw --no-pager -l --lines=10
         cleanup_and_exit 1
     fi
 }
@@ -705,12 +832,14 @@ main() {
     # 配置 SSH
     configure_ssh "$SSH_PORT" "$SSH_PUBLIC_KEY"
     
-    # 配置 fail2ban
-    if configure_fail2ban "$SSH_PORT"; then
-        print_info "fail2ban 配置完成"
-    else
-        print_warning "fail2ban 配置可能有问题，但脚本继续执行"
+    # 配置 fail2ban（必须成功）
+    print_info "配置 fail2ban（安全防护必需组件）..."
+    if ! configure_fail2ban "$SSH_PORT"; then
+        print_error "fail2ban 配置失败，这是关键安全组件"
+        print_error "脚本无法继续执行，请检查系统状态"
+        cleanup_and_exit 1
     fi
+    print_info "fail2ban 配置并验证完成"
     
     # 配置防火墙
     configure_firewall "$
