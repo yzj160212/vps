@@ -163,6 +163,10 @@ configure_ssh() {
     
     # 修改 SSH 端口
     sed -i "s/^#*Port.*/Port $ssh_port/" /etc/ssh/sshd_config
+    # 确保端口配置生效，如果上面的替换没有匹配到任何行，则添加端口配置
+    if ! grep -q "^Port $ssh_port" /etc/ssh/sshd_config; then
+        echo "Port $ssh_port" >> /etc/ssh/sshd_config
+    fi
     # 针对低配置VPS，降低日志级别（如果配置文件中是VERBOSE）
     sed -i 's/LogLevel VERBOSE/LogLevel INFO/' /etc/ssh/sshd_config
     check_command "SSH 端口修改为 $ssh_port"
@@ -257,9 +261,32 @@ EOF
     # 生成一些初始日志内容，确保文件不为空
     logger -p auth.info "fail2ban setup: SSH service configured"
     
+    # 创建备用配置的函数
+    create_fallback_config() {
+        cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 86400
+findtime = 600
+maxretry = 5
+backend = systemd
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = $ssh_port
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+EOF
+    }
+    
     # 下载你的自定义配置文件
     if wget -O /etc/fail2ban/jail.local https://raw.githubusercontent.com/yzj160212/vps/main/jail.local; then
         print_info "fail2ban 配置文件下载成功"
+        
+        # 修改配置文件中的 SSH 端口
+        sed -i "s/port = ssh/port = $ssh_port/" /etc/fail2ban/jail.local
+        print_info "fail2ban SSH 端口已更新为: $ssh_port"
         
         # 验证下载的配置文件
         if ! fail2ban-client -t 2>/dev/null; then
@@ -271,25 +298,6 @@ EOF
         create_fallback_config
     fi
     
-    # 创建备用配置的函数
-    create_fallback_config() {
-        cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime = 86400
-findtime = 600
-maxretry = 5
-backend = systemd
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-EOF
-    }
-    
     # 验证配置文件
     print_info "验证 fail2ban 配置..."
     if ! fail2ban-client -t 2>/dev/null; then
@@ -299,7 +307,7 @@ EOF
         # 再次验证
         if ! fail2ban-client -t 2>/dev/null; then
             print_warning "使用最基础配置"
-            cat > /etc/fail2ban/jail.local << 'EOF'
+            cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -308,7 +316,7 @@ ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
-port = ssh
+port = $ssh_port
 filter = sshd
 logpath = /var/log/auth.log
 maxretry = 5
