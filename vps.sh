@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Debian 12 VPS 设置脚本
-# 优化版本，确保与 Debian 12 完全兼容
+# 优化版本，修复逻辑问题，确保与 Debian 12 完全兼容
 
 set -e  # 如果任何命令失败，立即退出
 
@@ -10,13 +10,31 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a  # 自动重启服务，不询问
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m' # No Color
 
-# 日志变量
+# 全局变量
 CONFIG_LIST=""
+SSH_PORT=""
+SSH_PUBLIC_KEY=""
+
+# 清理函数
+cleanup_and_exit() {
+    local exit_code="${1:-1}"
+    # 清理临时文件
+    rm -f /tmp/sshd_config.temp /tmp/jail.local.temp 2>/dev/null || true
+    
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "脚本执行失败，退出码: $exit_code"
+    fi
+    
+    exit $exit_code
+}
+
+# 设置信号处理
+trap 'cleanup_and_exit 130' INT TERM
 
 # 函数：打印彩色信息
 print_info() {
@@ -31,14 +49,24 @@ print_error() {
     printf "${RED}[ERROR]${NC} %s\n" "$1"
 }
 
-# 函数：检查命令执行状态
-check_command() {
-    if [ $? -eq 0 ]; then
-        print_info "$1 成功"
-        CONFIG_LIST+="✓ $1 成功\n"
+# 函数：安全执行命令并检查状态
+safe_execute() {
+    local cmd="$1"
+    local desc="$2"
+    local allow_fail="${3:-false}"
+    
+    if eval "$cmd"; then
+        print_info "$desc 成功"
+        CONFIG_LIST+="✓ $desc 成功\n"
+        return 0
     else
-        print_error "$1 失败"
-        exit 1
+        if [[ "$allow_fail" == "true" ]]; then
+            print_warning "$desc 失败，但继续执行"
+            return 1
+        else
+            print_error "$desc 失败"
+            cleanup_and_exit 1
+        fi
     fi
 }
 
@@ -72,7 +100,7 @@ EOF
         sed -i 's/#$nrconf{restart} = .*/\$nrconf{restart} = '\''a'\'';/' /etc/needrestart/needrestart.conf
     fi
     
-    check_command "APT 非交互式配置"
+    safe_execute "true" "APT 非交互式配置"
 }
 
 # 函数：检查磁盘空间
@@ -84,8 +112,8 @@ check_disk_space() {
     
     print_info "可用磁盘空间: ${available_gb}GB"
     
-    if [ "$available_gb" -lt 1 ]; then
-        print_warning "磁盘空间不足 1GB，建议清理后再运行脚本"
+    if [ "$available_gb" -lt 2 ]; then
+        print_warning "磁盘空间不足 2GB，建议清理后再运行脚本"
         print_info "可以运行以下命令清理："
         print_info "sudo apt clean && sudo apt autoclean"
         print_info "sudo journalctl --vacuum-size=50M"
@@ -133,6 +161,47 @@ check_debian_version() {
     fi
 }
 
+# 创建内嵌的 SSH 配置
+create_ssh_config() {
+    local ssh_port="$1"
+    
+    cat > /tmp/sshd_config.temp << EOF
+# Debian 12 VPS 优化 SSH 配置
+Port $ssh_port
+Protocol 2
+
+# 认证设置
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+
+# 安全设置
+AllowUsers root
+MaxAuthTries 3
+MaxStartups 2:30:10
+LoginGraceTime 30
+
+# 性能优化（低配 VPS）
+ClientAliveInterval 300
+ClientAliveCountMax 2
+TCPKeepAlive yes
+Compression yes
+
+# 日志最小化
+LogLevel INFO
+SyslogFacility AUTH
+
+# 其他设置
+X11Forwarding no
+PrintMotd no
+PrintLastLog no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+}
+
 # 函数：配置 SSH
 configure_ssh() {
     local ssh_port="$1"
@@ -145,27 +214,34 @@ configure_ssh() {
     cp /etc/ssh/sshd_config "$backup_file"
     print_info "SSH 配置已备份到: $backup_file"
     
-    # 下载 SSH 配置文件
-    if wget -O /etc/ssh/sshd_config https://raw.githubusercontent.com/yzj160212/vps/main/sshd_config; then
+    # 尝试下载 SSH 配置文件，失败则使用内嵌配置
+    if wget -O /tmp/sshd_config.temp https://raw.githubusercontent.com/yzj160212/vps/main/sshd_config 2>/dev/null; then
         print_info "SSH 配置文件下载成功"
+        # 修改端口
+        sed -i "s/^#*Port.*/Port $ssh_port/" /tmp/sshd_config.temp
+        # 针对低配置VPS，降低日志级别
+        sed -i 's/LogLevel VERBOSE/LogLevel INFO/' /tmp/sshd_config.temp
     else
-        print_warning "SSH 配置文件下载失败，使用默认配置"
-        # 如果下载失败，恢复备份并手动配置关键选项
+        print_warning "SSH 配置文件下载失败，使用内嵌配置"
+        create_ssh_config "$ssh_port"
+    fi
+    
+    # 验证配置文件
+    if sshd -t -f /tmp/sshd_config.temp; then
+        mv /tmp/sshd_config.temp /etc/ssh/sshd_config
+        safe_execute "true" "SSH 配置文件应用"
+    else
+        print_error "SSH 配置验证失败，恢复备份"
         cp "$backup_file" /etc/ssh/sshd_config
-        
-        # 手动配置关键安全选项
+        # 手动配置关键选项
         sed -i 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
         sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
         sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-        # 降低日志级别以减少日志量（低配置VPS优化）
+        sed -i "s/^#*Port.*/Port $ssh_port/" /etc/ssh/sshd_config
         sed -i 's/^#*LogLevel.*/LogLevel INFO/' /etc/ssh/sshd_config
     fi
     
-    # 修改 SSH 端口
-    sed -i "s/^#*Port.*/Port $ssh_port/" /etc/ssh/sshd_config
-    # 针对低配置VPS，降低日志级别（如果配置文件中是VERBOSE）
-    sed -i 's/LogLevel VERBOSE/LogLevel INFO/' /etc/ssh/sshd_config
-    check_command "SSH 端口修改为 $ssh_port"
+    safe_execute "true" "SSH 端口修改为 $ssh_port"
     
     # 确保 root 用户的 .ssh 目录存在并设置权限
     mkdir -p /root/.ssh
@@ -176,7 +252,6 @@ configure_ssh() {
     chmod 600 /root/.ssh/authorized_keys
     
     # 写入公钥（避免重复）
-    # 使用更安全的方式检查和添加公钥
     local key_fingerprint=$(echo "$ssh_public_key" | awk '{print $2}')
     if ! grep -q "$key_fingerprint" /root/.ssh/authorized_keys 2>/dev/null; then
         echo "$ssh_public_key" >> /root/.ssh/authorized_keys
@@ -190,7 +265,7 @@ configure_ssh() {
         print_info "SSH 配置语法检查通过"
     else
         print_error "SSH 配置语法错误，请检查"
-        exit 1
+        cleanup_and_exit 1
     fi
 }
 
@@ -200,23 +275,50 @@ restart_ssh() {
     
     # Debian 12 兼容的重启方式
     if systemctl restart ssh; then
-        print_info "SSH 服务重启成功"
+        safe_execute "true" "SSH 服务重启"
     elif systemctl restart sshd; then
-        print_info "SSH 服务重启成功 (使用 sshd)"
+        safe_execute "true" "SSH 服务重启 (使用 sshd)"
     elif service ssh restart; then
-        print_info "SSH 服务重启成功 (使用 service)"
+        safe_execute "true" "SSH 服务重启 (使用 service)"
     else
         print_error "SSH 服务重启失败"
-        exit 1
+        cleanup_and_exit 1
     fi
     
     # 检查服务状态
     if systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; then
         print_info "SSH 服务运行正常"
+        # 验证端口监听
+        if ss -tln | grep -q ":$SSH_PORT "; then
+            safe_execute "true" "SSH 端口 $SSH_PORT 监听正常"
+        else
+            print_warning "SSH 端口监听检查异常"
+        fi
     else
         print_error "SSH 服务未正常运行"
-        exit 1
+        cleanup_and_exit 1
     fi
+}
+
+# 创建内嵌的 fail2ban 配置
+create_fail2ban_config() {
+    local ssh_port="$1"
+    
+    cat > /tmp/jail.local.temp << EOF
+[DEFAULT]
+bantime = 86400
+findtime = 600
+maxretry = 5
+backend = systemd
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+port = $ssh_port
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+EOF
 }
 
 # 函数：配置 fail2ban
@@ -226,8 +328,7 @@ configure_fail2ban() {
     print_info "正在安装和配置 fail2ban..."
     
     # 安装 fail2ban 和相关依赖
-    apt install fail2ban iptables -y
-    check_command "fail2ban 安装"
+    safe_execute "apt install fail2ban iptables -y" "fail2ban 安装"
     
     # 创建本地配置目录
     mkdir -p /etc/fail2ban
@@ -257,66 +358,33 @@ EOF
     # 生成一些初始日志内容，确保文件不为空
     logger -p auth.info "fail2ban setup: SSH service configured"
     
-    # 下载你的自定义配置文件
-    if wget -O /etc/fail2ban/jail.local https://raw.githubusercontent.com/yzj160212/vps/main/jail.local; then
+    # 尝试下载配置文件，失败则使用内嵌配置
+    if wget -O /tmp/jail.local.temp https://raw.githubusercontent.com/yzj160212/vps/main/jail.local 2>/dev/null; then
         print_info "fail2ban 配置文件下载成功"
+        
+        # 替换下载配置文件中的端口号
+        sed -i "/^\[sshd\]/,/^\[/ s/port = ssh/port = $ssh_port/" /tmp/jail.local.temp
         
         # 验证下载的配置文件
         if ! fail2ban-client -t 2>/dev/null; then
-            print_warning "下载的配置文件有问题，使用备用配置"
-            create_fallback_config
+            print_warning "下载的配置文件有问题，使用内嵌配置"
+            create_fail2ban_config "$ssh_port"
         fi
     else
-        print_warning "fail2ban 配置文件下载失败，使用基础配置"
-        create_fallback_config
+        print_warning "fail2ban 配置文件下载失败，使用内嵌配置"
+        create_fail2ban_config "$ssh_port"
     fi
-    
-    # 创建备用配置的函数
-    create_fallback_config() {
-        cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime = 86400
-findtime = 600
-maxretry = 5
-backend = systemd
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-EOF
-    }
     
     # 验证配置文件
     print_info "验证 fail2ban 配置..."
-    if ! fail2ban-client -t 2>/dev/null; then
-        print_warning "配置验证失败，使用简化配置"
-        create_fallback_config
-        
-        # 再次验证
-        if ! fail2ban-client -t 2>/dev/null; then
-            print_warning "使用最基础配置"
-            cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 5
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-EOF
-        fi
+    if fail2ban-client -t 2>/dev/null; then
+        mv /tmp/jail.local.temp /etc/fail2ban/jail.local
+        print_info "fail2ban 配置验证完成"
+    else
+        print_warning "配置验证失败，使用最简配置"
+        create_fail2ban_config "$ssh_port"
+        mv /tmp/jail.local.temp /etc/fail2ban/jail.local
     fi
-    
-    print_info "fail2ban 配置验证完成"
     
     # 启动并启用 fail2ban 服务
     systemctl enable fail2ban
@@ -347,8 +415,10 @@ EOF
             if fail2ban-client status 2>/dev/null | grep -q "sshd"; then
                 print_info "fail2ban SSH jail 运行正常"
                 fail2ban-client status sshd 2>/dev/null || true
+                safe_execute "true" "fail2ban 服务启动和启用"
             else
                 print_warning "fail2ban SSH jail 可能未正确加载"
+                safe_execute "true" "fail2ban 服务启动和启用" "true"
             fi
             break
         else
@@ -372,9 +442,6 @@ EOF
         journalctl -u fail2ban --no-pager -l --lines=20
         print_warning "继续执行脚本，但 fail2ban 保护可能不可用"
         return 1
-    else
-        print_info "fail2ban 服务启动和启用 成功"
-        CONFIG_LIST+="✓ fail2ban 服务启动和启用 成功\n"
     fi
     
     # 确保函数返回成功状态
@@ -404,8 +471,8 @@ Storage=persistent
 EOF
     
     # 重启 journald 服务应用配置
-    systemctl restart systemd-journald
-    check_command "systemd 日志配置优化"
+    systemctl restart systemd-journald >/dev/null 2>&1
+    safe_execute "true" "systemd 日志配置优化"
     
     # 配置 logrotate 更频繁地轮转日志
     cat > /etc/logrotate.d/vps-optimize << 'EOF'
@@ -465,12 +532,12 @@ EOF
     
     # 立即清理旧日志
     print_info "清理现有大日志文件..."
-    journalctl --vacuum-size=30M
-    journalctl --vacuum-time=3d
+    journalctl --vacuum-size=30M >/dev/null 2>&1
+    journalctl --vacuum-time=3d >/dev/null 2>&1
     
     # 清理 apt 缓存
-    apt clean
-    apt autoclean
+    apt clean >/dev/null 2>&1
+    apt autoclean >/dev/null 2>&1
     
     # 添加定期清理的 cron 任务
     cat > /etc/cron.weekly/vps-cleanup << 'EOF'
@@ -513,7 +580,7 @@ EOF
     
     chmod +x /etc/cron.weekly/vps-cleanup
     
-    check_command "日志轮转和清理配置"
+    safe_execute "true" "日志轮转和清理配置"
 }
 
 # 函数：配置防火墙
@@ -522,67 +589,44 @@ configure_firewall() {
     
     print_info "正在配置 UFW 防火墙..."
     
-    # 安装 UFW
-    apt install ufw -y
-    check_command "UFW 安装"
+    # 确保 UFW 已安装
+    if ! command -v ufw >/dev/null 2>&1; then
+        safe_execute "apt install ufw -y" "UFW 安装"
+    else
+        print_info "UFW 已安装"
+    fi
     
     # 重置防火墙规则
-    ufw --force reset
+    safe_execute "ufw --force reset" "重置防火墙规则"
     
     # 设置默认策略
-    ufw default deny incoming
-    ufw default allow outgoing
+    safe_execute "ufw default deny incoming" "设置默认拒绝入站"
+    safe_execute "ufw default allow outgoing" "设置默认允许出站"
     
     # 允许 SSH 端口
-    ufw allow "$ssh_port"/tcp
-    check_command "放行 SSH 端口 $ssh_port"
+    safe_execute "ufw allow $ssh_port/tcp" "放行 SSH 端口 $ssh_port"
     
     # 允许 HTTP 和 HTTPS 端口
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    check_command "放行 HTTP 和 HTTPS 端口"
+    safe_execute "ufw allow 80/tcp" "放行 HTTP 端口"
+    safe_execute "ufw allow 443/tcp" "放行 HTTPS 端口"
     
     # 启用 UFW（非交互式）
-    echo "y" | ufw enable
-    check_command "UFW 启用"
+    safe_execute "echo 'y' | ufw enable" "UFW 启用"
     
-    # 显示防火墙状态
-    print_info "防火墙规则:"
-    ufw status numbered
+    # 验证防火墙状态
+    if ufw status | grep -q "Status: active"; then
+        print_info "防火墙已成功启用"
+        # 显示防火墙规则
+        print_info "防火墙规则:"
+        ufw status numbered
+    else
+        print_error "防火墙启用验证失败"
+        cleanup_and_exit 1
+    fi
 }
 
-# 主函数
-main() {
-    print_info "开始执行 Debian 12 VPS 配置脚本..."
-    
-    # 检查权限和系统版本
-    check_root
-    check_debian_version
-    check_disk_space
-    check_network
-    
-    # 配置非交互式模式
-    configure_apt_noninteractive
-    
-    # 更新系统
-    print_info "正在更新系统..."
-    apt update && apt upgrade -y
-    check_command "系统更新"
-    
-    # 安装必要的工具
-    print_info "正在安装必要工具..."
-    apt install -y wget curl sudo systemd-timesyncd openssh-server rsyslog
-    check_command "必要工具安装"
-    
-    # 确保 SSH 服务已启动并启用
-    systemctl enable ssh
-    systemctl start ssh
-    
-    # 更改时区
-    print_info "正在设置时区为亚洲/上海..."
-    timedatectl set-timezone Asia/Shanghai
-    check_command "时区设置"
-    
+# 函数：获取用户输入并验证
+get_user_input() {
     # 获取用户输入 - SSH 端口
     while true; do
         printf "${GREEN}请输入自定义 SSH 端口号 (1024-65535，建议使用 10000-65535):${NC} "
@@ -623,6 +667,40 @@ main() {
             print_info "或: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
         fi
     done
+}
+
+# 主函数
+main() {
+    print_info "开始执行 Debian 12 VPS 配置脚本..."
+    
+    # 检查权限和系统版本
+    check_root
+    check_debian_version
+    check_disk_space
+    check_network
+    
+    # 配置非交互式模式
+    configure_apt_noninteractive
+    
+    # 更新系统
+    print_info "正在更新系统..."
+    safe_execute "apt update" "更新软件包列表"
+    safe_execute "apt upgrade -y" "升级系统软件包"
+    
+    # 安装必要的工具
+    print_info "正在安装必要工具..."
+    safe_execute "apt install -y wget curl sudo systemd-timesyncd openssh-server rsyslog" "必要工具安装"
+    
+    # 确保 SSH 服务已启动并启用
+    systemctl enable ssh >/dev/null 2>&1
+    systemctl start ssh >/dev/null 2>&1
+    
+    # 更改时区
+    print_info "正在设置时区为亚洲/上海..."
+    safe_execute "timedatectl set-timezone Asia/Shanghai" "时区设置"
+    
+    # 获取用户输入
+    get_user_input
     
     # 配置 SSH
     configure_ssh "$SSH_PORT" "$SSH_PUBLIC_KEY"
@@ -635,57 +713,4 @@ main() {
     fi
     
     # 配置防火墙
-    configure_firewall "$SSH_PORT"
-    
-    # 配置日志管理（低配置VPS优化）
-    configure_logs
-    
-    # 重启 SSH 服务（在防火墙配置完成后）
-    restart_ssh
-    
-    # 显示配置摘要
-    print_info "=== 配置完成摘要 ==="
-    printf "${CONFIG_LIST}"
-    
-    print_info "=== 重要信息 ==="
-    print_warning "SSH 端口已修改为: $SSH_PORT"
-    print_warning "请确保在断开连接前，用新端口测试 SSH 连接!"
-    print_warning "测试命令: ssh -p $SSH_PORT root@$(hostname -I | awk '{print $1}')"
-    print_warning "如果连接失败，可以通过 VPS 控制台恢复访问"
-    
-    print_info "=== 服务状态 ==="
-    echo "SSH 服务状态:"
-    systemctl status ssh --no-pager -l | head -3
-    echo ""
-    echo "fail2ban 服务状态:"
-    systemctl status fail2ban --no-pager -l | head -3
-    echo ""
-    echo "UFW 防火墙状态:"
-    ufw status
-    echo ""
-    echo "磁盘使用情况:"
-    df -h / | grep -v Filesystem
-    echo ""
-    echo "内存使用情况:"
-    free -h | grep -E "Mem|Swap"
-    echo ""
-    echo "日志文件占用情况:"
-    echo "auth.log: $(du -h /var/log/auth.log 2>/dev/null | cut -f1 || echo '0K')"
-    echo "fail2ban.log: $(du -h /var/log/fail2ban.log 2>/dev/null | cut -f1 || echo '0K')"
-    echo "systemd journal: $(journalctl --disk-usage 2>/dev/null | grep -o '[0-9.]*[KMGT]' || echo '未知')"
-    echo "总日志目录: $(du -sh /var/log 2>/dev/null | cut -f1 || echo '未知')"
-    
-    print_info "脚本执行完成！建议重启系统以确保所有配置生效。"
-    read -p "是否立即重启系统？(y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_info "系统将在 10 秒后重启..."
-        sleep 10
-        reboot
-    else
-        print_info "请稍后手动重启系统: sudo reboot"
-    fi
-}
-
-# 执行主函数
-main "$@"
+    configure_firewall "$
