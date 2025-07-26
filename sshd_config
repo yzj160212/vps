@@ -1,5 +1,4 @@
 # Debian 12 优化的 SSH 配置文件
-# 基于 OpenSSH 9.2+ (Debian 12 默认版本)
 
 # 网络配置
 #Port 22                           # 端口将通过脚本修改
