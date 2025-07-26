@@ -15,6 +15,3 @@ enabled = true
 port = ssh
 filter = sshd
 logpath = /var/log/auth.log
-maxretry = 3            # SSH 失败3次就封禁
-bantime = 604800        # SSH 攻击封禁7天
-findtime = 600          # 10分钟内检测
