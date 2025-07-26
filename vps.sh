@@ -271,9 +271,6 @@ EOF
         create_fallback_config
     fi
     
-    # 可选：明确指定SSH端口（虽然port=ssh已经足够）
-    # sed -i "s/port = ssh/port = $ssh_port/" /etc/fail2ban/jail.local
-    
     # 创建备用配置的函数
     create_fallback_config() {
         cat > /etc/fail2ban/jail.local << 'EOF'
@@ -289,6 +286,7 @@ enabled = true
 port = ssh
 filter = sshd
 logpath = /var/log/auth.log
+maxretry = 5
 EOF
     }
     
@@ -310,6 +308,10 @@ ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
 EOF
         fi
     fi
