@@ -1,26 +1,19 @@
 #!/bin/bash
 
 # Debian 12 VPS 设置脚本
-# 优化版本，修复逻辑问题，确保与 Debian 12 完全兼容
 
-set -e  # 如果任何命令失败，立即退出
-
-# 设置非交互式模式，避免安装过程中的交互提示
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a  # 自动重启服务，不询问
+set -e
 
 # 颜色定义
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly NC='\033[0m' # No Color
+readonly NC='\033[0m'
 
-# 全局变量
 CONFIG_LIST=""
 SSH_PORT=""
 SSH_PUBLIC_KEY=""
 
-# 清理函数
 cleanup_and_exit() {
     local exit_code="${1:-1}"
     rm -f /tmp/sshd_config.temp /tmp/jail.local.temp 2>/dev/null || true
@@ -32,17 +25,9 @@ cleanup_and_exit() {
 
 trap 'cleanup_and_exit 130' INT TERM
 
-print_info() {
-    printf "${GREEN}[INFO]${NC} %s\n" "$1"
-}
-
-print_warning() {
-    printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
-}
-
-print_error() {
-    printf "${RED}[ERROR]${NC} %s\n" "$1"
-}
+print_info()    { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
+print_warning() { printf "${YELLOW}[WARNING]${NC} %s\n" "$1"; }
+print_error()   { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 safe_execute() {
     local cmd="$1"
@@ -197,7 +182,6 @@ configure_ssh() {
     chmod 700 /root/.ssh
     touch /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
-    # 更健壮的公钥去重
     if ! grep -qF "$ssh_public_key" /root/.ssh/authorized_keys 2>/dev/null; then
         echo "$ssh_public_key" >> /root/.ssh/authorized_keys
         print_info "SSH 公钥已添加"
@@ -251,8 +235,6 @@ ignoreip = 127.0.0.1/8 ::1
 enabled = true
 port = $ssh_port
 filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
 EOF
 }
 
@@ -261,29 +243,19 @@ configure_fail2ban() {
     print_info "正在安装和配置 fail2ban..."
     safe_execute "apt install fail2ban iptables -y" "fail2ban 安装"
     mkdir -p /etc/fail2ban
-    touch /var/log/auth.log
-    chmod 640 /var/log/auth.log
-    chown root:adm /var/log/auth.log
-    cat > /etc/rsyslog.d/49-vps-optimize.conf << 'EOF'
-auth,authpriv.*                 /var/log/auth.log
-:msg, contains, "systemd-logind" stop
-:msg, contains, "CRON" stop
-EOF
-    systemctl enable rsyslog
-    systemctl restart rsyslog
-    sleep 3
-    logger -p auth.info "fail2ban setup: SSH service configured"
+
+    # 生成适合 Debian 12 的 jail.local（systemd 监控，不要 logpath）
+    create_fail2ban_config "$ssh_port"
+
+    # 下载并替换配置文件
     if wget -O /tmp/jail.local.temp https://raw.githubusercontent.com/yzj160212/vps/main/jail.local 2>/dev/null; then
         print_info "fail2ban 配置文件下载成功"
-        sed -i "/^\[sshd\]/,/^\[/ s/port = ssh/port = $ssh_port/" /tmp/jail.local.temp
-        if ! fail2ban-client -t 2>/dev/null; then
-            print_warning "下载的配置文件有问题，使用内嵌配置"
-            create_fail2ban_config "$ssh_port"
-        fi
-    else
-        print_warning "fail2ban 配置文件下载失败，使用内嵌配置"
-        create_fail2ban_config "$ssh_port"
+        # 自动修正 backend 或 logpath
+        sed -i '/^logpath/d' /tmp/jail.local.temp
+        sed -i 's/^backend = .*/backend = systemd/' /tmp/jail.local.temp
+        sed -i "/^\[sshd\]/,/^\[/ s/port = .*/port = $ssh_port/" /tmp/jail.local.temp
     fi
+
     print_info "验证 fail2ban 配置..."
     if fail2ban-client -t 2>/dev/null; then
         mv /tmp/jail.local.temp /etc/fail2ban/jail.local
@@ -293,96 +265,25 @@ EOF
         create_fail2ban_config "$ssh_port"
         mv /tmp/jail.local.temp /etc/fail2ban/jail.local
     fi
+
     systemctl enable fail2ban
-    if [ ! -s /var/log/auth.log ]; then
-        print_info "初始化 auth.log 文件..."
-        logger -p auth.info "fail2ban: Initial log entry for SSH monitoring"
-        echo "$(date) sshd[$$]: Server listening on 0.0.0.0 port $ssh_port." >> /var/log/auth.log
-    fi
     systemctl start fail2ban
+
     sleep 8
-    local retry_count=0
-    local max_retries=5
-    while [ $retry_count -lt $max_retries ]; do
-        if systemctl is-active --quiet fail2ban; then
-            print_info "fail2ban 服务运行正常"
-            sleep 5
-            if ! fail2ban-client ping 2>/dev/null | grep -q "pong"; then
-                print_error "fail2ban 客户端连接失败"
-                print_info "fail2ban 服务日志:"
-                journalctl -u fail2ban --no-pager -l --lines=15
-                cleanup_and_exit 1
-            fi
-            local fail2ban_status=$(fail2ban-client status 2>/dev/null)
-            print_info "fail2ban 整体状态:"
-            echo "$fail2ban_status"
-            if echo "$fail2ban_status" | grep -q "sshd"; then
-                print_info "fail2ban SSH jail 已加载"
-                local ssh_jail_status=$(fail2ban-client status sshd 2>/dev/null)
-                print_info "SSH jail 详细状态:"
-                echo "$ssh_jail_status"
-                if echo "$ssh_jail_status" | grep -q "Filter"; then
-                    print_info "SSH jail 过滤器配置正常"
-                else
-                    print_error "SSH jail 过滤器配置异常"
-                    cleanup_and_exit 1
-                fi
-                if echo "$ssh_jail_status" | grep -q "$ssh_port"; then
-                    print_info "SSH jail 端口配置正确 ($ssh_port)"
-                else
-                    print_warning "SSH jail 端口配置可能有问题，检查配置"
-                    echo "$ssh_jail_status"
-                fi
-                if echo "$ssh_jail_status" | grep -q "/var/log/auth.log"; then
-                    print_info "SSH jail 日志文件监控正常"
-                    if [ -r /var/log/auth.log ]; then
-                        print_info "auth.log 文件可读"
-                    else
-                        print_error "auth.log 文件不可读"
-                        ls -la /var/log/auth.log
-                        cleanup_and_exit 1
-                    fi
-                else
-                    print_error "SSH jail 日志文件配置异常"
-                    cleanup_and_exit 1
-                fi
-                safe_execute "true" "fail2ban 服务启动和验证"
-                break
-            else
-                print_error "fail2ban SSH jail 未正确加载"
-                print_info "可用的 jail 列表:"
-                echo "$fail2ban_status"
-                print_info "fail2ban 配置文件内容:"
-                cat /etc/fail2ban/jail.local 2>/dev/null || print_warning "无法读取 jail.local"
-                print_info "fail2ban 服务日志:"
-                journalctl -u fail2ban --no-pager -l --lines=20
-                cleanup_and_exit 1
-            fi
-        else
-            retry_count=$((retry_count + 1))
-            print_warning "fail2ban 启动中，等待重试... ($retry_count/$max_retries)"
-            if [ $retry_count -eq 2 ]; then
-                print_info "检查 fail2ban 启动错误:"
-                journalctl -u fail2ban --no-pager -l --lines=15
-                print_info "检查 fail2ban 配置:"
-                fail2ban-client -t 2>&1 || print_warning "配置测试失败"
-            fi
-            if [ $retry_count -lt $max_retries ]; then
-                print_info "尝试重新启动 fail2ban..."
-                systemctl stop fail2ban >/dev/null 2>&1
-                sleep 3
-                systemctl start fail2ban >/dev/null 2>&1
-                sleep 5
-            fi
-        fi
-    done
-    if ! systemctl is-active --quiet fail2ban; then
-        print_error "fail2ban 服务启动失败"
-        print_info "尝试查看服务日志:"
-        journalctl -u fail2ban --no-pager -l --lines=20
-        print_error "fail2ban 是关键安全组件，脚本无法继续"
+
+    # 只检查 jail 是否加载和过滤器是否正常，不做端口/日志判断
+    local ssh_jail_status=$(fail2ban-client status sshd 2>/dev/null)
+    if [[ -n "$ssh_jail_status" && "$ssh_jail_status" == *"Currently banned:"* && "$ssh_jail_status" == *"Filter"* ]]; then
+        print_info "fail2ban SSH jail 状态正常"
+        print_info "SSH jail 过滤器配置正常"
+    else
+        print_error "fail2ban SSH jail 状态异常"
+        print_info "fail2ban SSH jail 状态输出如下："
+        echo "$ssh_jail_status"
         cleanup_and_exit 1
     fi
+
+    safe_execute "true" "fail2ban 服务启动和验证"
     print_info "fail2ban 服务验证通过"
     return 0
 }
