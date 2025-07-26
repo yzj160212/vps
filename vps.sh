@@ -312,6 +312,7 @@ EOF
 bantime = 3600
 findtime = 600
 maxretry = 5
+backend = systemd
 ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
