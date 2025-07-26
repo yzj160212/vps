@@ -281,6 +281,7 @@ EOF
 bantime = 86400
 findtime = 600
 maxretry = 5
+backend = systemd
 ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
@@ -288,51 +289,32 @@ enabled = true
 port = ssh
 filter = sshd
 logpath = /var/log/auth.log
-maxretry = 5
-bantime = 86400
-findtime = 600
 EOF
     }
     
-    # 最终配置验证和修复
+    # 验证配置文件
     print_info "验证 fail2ban 配置..."
-    local config_attempts=0
-    while [ $config_attempts -lt 3 ]; do
-        if fail2ban-client -t 2>/dev/null; then
-            print_info "fail2ban 配置验证通过"
-            break
-        else
-            config_attempts=$((config_attempts + 1))
-            print_warning "配置验证失败，尝试修复... ($config_attempts/3)"
-            
-            if [ $config_attempts -eq 1 ]; then
-                # 第一次失败：尝试使用 systemd backend
-                sed -i '/backend = systemd/d' /etc/fail2ban/jail.local
-                echo "backend = systemd" >> /etc/fail2ban/jail.local
-            elif [ $config_attempts -eq 2 ]; then
-                # 第二次失败：使用最简配置
-                create_fallback_config
-            else
-                # 第三次失败：使用 systemd journal
-                cat > /etc/fail2ban/jail.local << 'EOF'
+    if ! fail2ban-client -t 2>/dev/null; then
+        print_warning "配置验证失败，使用简化配置"
+        create_fallback_config
+        
+        # 再次验证
+        if ! fail2ban-client -t 2>/dev/null; then
+            print_warning "使用最基础配置"
+            cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
-bantime = 86400
+bantime = 3600
 findtime = 600
 maxretry = 5
 ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
-port = ssh
-filter = sshd
-backend = systemd
-maxretry = 5
-bantime = 86400
-findtime = 600
 EOF
-            fi
         fi
-    done
+    fi
+    
+    print_info "fail2ban 配置验证完成"
     
     # 启动并启用 fail2ban 服务
     systemctl enable fail2ban
