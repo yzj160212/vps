@@ -1,0 +1,118 @@
+# Debian 12 优化的 SSH 配置文件
+# 基于 OpenSSH 9.2+ (Debian 12 默认版本)
+
+# 网络配置
+#Port 22                           # 端口将通过脚本修改
+#AddressFamily any
+#ListenAddress 0.0.0.0
+#ListenAddress ::
+
+# 主机密钥
+#HostKey /etc/ssh/ssh_host_rsa_key
+#HostKey /etc/ssh/ssh_host_ecdsa_key
+#HostKey /etc/ssh/ssh_host_ed25519_key
+
+# 加密和密钥交换
+#RekeyLimit default none
+
+# 日志配置
+#SyslogFacility AUTH
+LogLevel INFO                      # 平衡安全和性能，适合低配置VPS
+
+# 认证配置
+LoginGraceTime 2m                  # 登录宽限时间
+#StrictModes yes
+MaxAuthTries 3                     # 减少最大尝试次数（默认6，改为3更安全）
+MaxSessions 10
+
+# 公钥认证
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+# 禁用不安全的认证方式
+#HostbasedAuthentication no
+#IgnoreUserKnownHosts no
+#IgnoreRhosts yes
+
+# 密码认证（已禁用）
+PasswordAuthentication no          # 禁用密码认证
+PermitEmptyPasswords no           # 禁用空密码
+
+# 交互式认证 - 使用新的选项名
+KbdInteractiveAuthentication no    # 替代过时的 ChallengeResponseAuthentication
+
+# Kerberos 选项
+#KerberosAuthentication no
+#KerberosOrLocalPasswd yes
+#KerberosTicketCleanup yes
+#KerberosGetAFSToken no
+
+# GSSAPI 选项
+#GSSAPIAuthentication no
+#GSSAPICleanupCredentials yes
+
+# PAM 配置
+UsePAM yes                        # 启用PAM以支持更好的会话管理
+
+# 转发配置
+#AllowAgentForwarding yes
+#AllowTcpForwarding yes
+#GatewayPorts no
+X11Forwarding no                  # 服务器通常不需要X11转发，禁用以提高安全性
+#X11DisplayOffset 10
+#X11UseLocalhost yes
+
+# 会话配置
+#PermitTTY yes
+PrintMotd no
+#PrintLastLog yes
+#TCPKeepAlive yes
+#PermitUserEnvironment no
+#Compression delayed
+
+# 连接保活设置
+ClientAliveInterval 300           # 5分钟无活动后发送保活包
+ClientAliveCountMax 2             # 最多发送2次保活包
+
+# DNS和性能
+UseDNS no                         # 禁用DNS反向解析，提高连接速度
+
+# 进程和连接限制
+#PidFile /var/run/sshd.pid
+MaxStartups 5:30:10               # 限制并发连接数，防止暴力破解
+
+# 隧道和其他
+#PermitTunnel no
+#ChrootDirectory none
+#VersionAddendum none
+
+# 横幅
+#Banner /etc/ssh/banner            # 可选：显示登录横幅
+
+# 环境变量
+AcceptEnv LANG LC_*
+
+# SFTP子系统
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# ROOT登录配置 - 更安全的设置
+PermitRootLogin prohibit-password  # 只允许使用密钥登录root，禁用密码登录
+
+# 用户和组限制（可选配置）
+# AllowUsers user1 user2           # 只允许特定用户登录
+# AllowGroups ssh-users            # 只允许特定组登录
+# DenyUsers baduser                # 禁止特定用户登录
+
+# 针对不同用户的特殊配置示例
+#Match User ansible
+#    PasswordAuthentication no
+#    PubkeyAuthentication yes
+#    AllowTcpForwarding no
+
+# 安全增强配置
+# Protocol 2                      # OpenSSH 7.4+ 已移除此选项，默认只支持协议版本2
+StrictModes yes                   # 严格检查文件权限
+PermitUserEnvironment no          # 禁止用户设置环境变量
+
+# Debian 12 特定优化
+Include /etc/ssh/sshd_config.d/*.conf  # 包含额外配置文件（如果存在）

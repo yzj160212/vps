@@ -1,0 +1,20 @@
+# fail2ban jail.local 配置文件
+# 针对 Debian 12 优化
+
+[DEFAULT]
+# 全局默认设置
+bantime = 604800        # 7天封禁
+findtime = 600          # 10分钟检测窗口
+maxretry = 3            # 3次失败就封禁
+backend = systemd
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
+[sshd]
+# SSH 服务监控配置
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3            # SSH 失败3次就封禁
+bantime = 604800        # SSH 攻击封禁7天
+findtime = 600          # 10分钟内检测
