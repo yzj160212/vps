@@ -182,6 +182,12 @@ configure_ssh() {
     # 写入公钥（避免重复）
     # 使用更安全的方式检查和添加公钥
     local key_fingerprint=$(echo "$ssh_public_key" | awk '{print $2}')
+    
+    # 如果 key_fingerprint 为空，使用整个公钥的一部分作为标识
+    if [ -z "$key_fingerprint" ]; then
+        key_fingerprint=$(echo "$ssh_public_key" | cut -d' ' -f1-2)
+    fi
+    
     if ! grep -q "$key_fingerprint" /root/.ssh/authorized_keys 2>/dev/null; then
         echo "$ssh_public_key" >> /root/.ssh/authorized_keys
         print_info "SSH 公钥已添加"
@@ -618,18 +624,54 @@ main() {
         
         # 增强验证：检查SSH公钥格式
         if [[ -n "$SSH_PUBLIC_KEY" ]] && [[ "$SSH_PUBLIC_KEY" =~ ^ssh-(rsa|dss|ecdsa|ed25519)[[:space:]]+[A-Za-z0-9+/]+=*[[:space:]]*.*$ ]]; then
-            # 检查公钥长度（避免过短的无效公钥）
+            # 检查公钥长度（根据密钥类型调整长度验证）
             local key_length=${#SSH_PUBLIC_KEY}
-            if [ "$key_length" -gt 100 ] && [ "$key_length" -lt 4000 ]; then
-                print_info "SSH 公钥验证通过"
-                break
-            else
-                print_error "SSH 公钥长度异常，请检查公钥完整性"
-            fi
+            local key_type=$(echo "$SSH_PUBLIC_KEY" | awk '{print $1}')
+            
+            # 根据密钥类型验证长度
+            case "$key_type" in
+                "ssh-ed25519")
+                    # ed25519 密钥较短，通常 68-120 字符
+                    if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 200 ]; then
+                        print_info "SSH ed25519 公钥验证通过"
+                        break
+                    else
+                        print_error "SSH ed25519 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+                    fi
+                    ;;
+                "ssh-rsa")
+                    # RSA 密钥较长，通常 300-800 字符
+                    if [ "$key_length" -gt 200 ] && [ "$key_length" -lt 1000 ]; then
+                        print_info "SSH RSA 公钥验证通过"
+                        break
+                    else
+                        print_error "SSH RSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+                    fi
+                    ;;
+                "ssh-ecdsa")
+                    # ECDSA 密钥中等长度，通常 150-300 字符
+                    if [ "$key_length" -gt 100 ] && [ "$key_length" -lt 500 ]; then
+                        print_info "SSH ECDSA 公钥验证通过"
+                        break
+                    else
+                        print_error "SSH ECDSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+                    fi
+                    ;;
+                *)
+                    # 其他类型或通用验证
+                    if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 1000 ]; then
+                        print_info "SSH 公钥验证通过"
+                        break
+                    else
+                        print_error "SSH 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+                    fi
+                    ;;
+            esac
         else
-            print_error "SSH 公钥格式无效，公钥应该以 'ssh-rsa', 'ssh-ed25519' 等开头"
-            print_info "示例: ssh-rsa AAAAB3NzaC1yc2EAAAA... user@host"
-            print_info "或: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
+            print_error "SSH 公钥格式无效，公钥应该以 'ssh-rsa', 'ssh-ed25519', 'ssh-ecdsa' 等开头"
+            print_info "示例 RSA: ssh-rsa AAAAB3NzaC1yc2EAAAA... user@host"
+            print_info "示例 Ed25519: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
+            print_info "示例 ECDSA: ssh-ecdsa AAAAE2VjZHNhLXNoYTItbmlzdHA... user@host"
         fi
     done
     
