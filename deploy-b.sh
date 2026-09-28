@@ -397,6 +397,18 @@ run_bootstrap() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ============================ 监听套接字（统一封装）============================
+# ⚠️ `ss` / `netstat` 在「没有任何匹配」时**同样会打印表头**，
+# 所以绝不能用「输出是否为空」判断端口占用或隧道是否建立。
+# 不使用 ss 的 -H 开关（较新 iproute2 才有，老版本会报错退出）。
+listen_lines() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | awk '$1=="LISTEN"' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tlnp 2>/dev/null | awk '$1 ~ /^tcp/ && $6=="LISTEN"' || true
+  fi
+}
+
 # 注：原 setup-b.sh 里的 SSHD_BIN 解析、sshd_current_ports()、ssh_migrate_stage1()
 # 和 ssh_finalize() 已整体删除。SSH 端口加固现在由第 1 步的开荒脚本（vps.sh）负责，
 # 留着那套「两阶段迁移」只会在已开荒的机器上制造把 22 重新打开的风险。
@@ -624,8 +636,8 @@ if [[ "$DRY_RUN" -eq 0 && -f "$STATE_DIR/state-b.env" && "$FORCE" -ne 1 ]]; then
 fi
 
 # 非空白环境提醒：列出其他服务（脚本不会触碰它们）
-if [[ "$DRY_RUN" -eq 0 ]] && command -v ss >/dev/null 2>&1; then
-  busy="$(ss -ltnp 2>/dev/null | grep -vE 'xray|sshd' || true)"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  busy="$(listen_lines | grep -vE 'xray|sshd' || true)"
   if [[ -n "$busy" ]]; then
     info "当前监听中的其他服务（脚本不会触碰它们）："
     printf '%s\n' "$busy" | sed 's/^/    /'
@@ -704,13 +716,14 @@ if systemctl is-active --quiet xray; then printf '%sactive%s\n' "$C_G" "$C_0"; e
 printf '  %-46s' "2. 到 A 的反向隧道连接 (ESTAB)"
 estab=""
 if command -v ss >/dev/null 2>&1; then
-  estab="$(ss -tnpH "dport = :${REVERSE_PORT}" 2>/dev/null | grep -i estab || true)"
+  # 不用 -H（老 iproute2 会报错）；用状态字段过滤，表头的 $1 是 "State" 自然被排除
+  estab="$(ss -tnp 2>/dev/null | awk -v p="$REVERSE_PORT" '$4 ~ "[.:]"p"$" && tolower($1)=="estab"' || true)"
 fi
 if [[ -n "$estab" ]]; then printf '%s已建立%s\n' "$C_G" "$C_0"; else printf '%s未建立（可能仍在重连，稍后重跑本脚本）%s\n' "$C_Y" "$C_0"; fi
 
 printf '  %-46s' "3. 对外监听端口（应只有 SSH）"
 if command -v ss >/dev/null 2>&1; then
-  listen="$(ss -ltnp 2>/dev/null | grep -vE '127\.0\.0\.1|\[::1\]' || true)"
+  listen="$(listen_lines | grep -vE '127\.0\.0\.1|\[::1\]' || true)"
   if [[ -z "$listen" ]]; then printf '%s无%s\n' "$C_G" "$C_0"; else printf '%s见下%s\n' "$C_Y" "$C_0"; printf '%s\n' "$listen" | sed 's/^/       /'; fi
 else
   printf '跳过（无 ss）\n'

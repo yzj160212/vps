@@ -538,19 +538,33 @@ rand_port() {
   fi
 }
 
+# ============================ 监听套接字（统一封装）============================
+# ⚠️ 这里踩过一个大坑，改代码前务必看完：
+#
+#   `ss` 和 `netstat` 在「没有任何匹配」时**同样会打印表头**。
+#   所以任何地方都**不能**用「输出是否为空」来判断端口占用 ——
+#   表头会让输出永远非空，于是「端口空闲」被误判成「端口被占用」，
+#   脚本在任何机器上都会直接失败。
+#
+# 另外不使用 ss 的 -H（no-header）开关：那是较新的 iproute2 才有的，
+# 老版本会直接报错退出，方向更危险（报错→无输出→误判成空闲）。
+# 统一在这里过滤表头，别的地方一律调这个函数。
+#
+# 过滤方式：只保留真正的数据行。
+#   ss -ltnp      → 数据行 $1 == "LISTEN"
+#   netstat -tlnp → 数据行 $1 以 tcp 开头、$6 == "LISTEN"
+listen_lines() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | awk '$1=="LISTEN"' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tlnp 2>/dev/null | awk '$1 ~ /^tcp/ && $6=="LISTEN"' || true
+  fi
+}
+
 # 端口是否已被监听（挑反向端口时用来避开冲突）
-# 注意：不使用 ss 的 -H（no-header）开关 —— 那是较新的 iproute2 才有的，
-# 老版本会直接报错退出，导致「端口被占用」被误判成「空闲」。
-# 交给 awk 过滤表头即可：表头的 $4 是 "Local"，永远匹配不上 "[.:]<port>$"。
 port_in_use() {
   local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltn 2>/dev/null | awk -v p="$port" '$4 ~ "[.:]"p"$"{f=1} END{exit !f}'
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -tln 2>/dev/null | awk -v p="$port" '$4 ~ "[.:]"p"$"{f=1} END{exit !f}'
-  else
-    return 1
-  fi
+  [[ -n "$(listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
 }
 
 # 未显式指定 --reverse-port 时，随机挑一个「没被占用、也不是 SSH/入口端口」的反向端口。
@@ -709,17 +723,8 @@ open_port() {
 # ss 的 "sport = :" 过滤器在老版本 iproute2 上可能不支持，故带一层回退
 check_port_free() {
   local port="$1" who="" ssh_ports=""
-  if command -v ss >/dev/null 2>&1; then
-    # 老版本 iproute2 不支持 "sport = :" 过滤器，也不一定支持 -H，故不加 -H 并带回退
-    who="$(ss -ltnp "sport = :$port" 2>/dev/null || true)"
-    if [[ -z "$who" ]]; then
-      who="$(ss -ltnp 2>/dev/null | awk -v p="$port" '$4 ~ "[.:]"p"$"{print}' || true)"
-    fi
-  elif command -v netstat >/dev/null 2>&1; then
-    who="$(netstat -tlnp 2>/dev/null | awk -v p="$port" '$4 ~ "[.:]"p"$"{print}' || true)"
-  else
-    return 0
-  fi
+  # 必须走 listen_lines()：直接拿 ss 输出判断，表头会让端口永远"被占用"
+  who="$(listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print}')" || true
 
   [[ -z "$who" ]] && return 0
 
