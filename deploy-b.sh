@@ -750,8 +750,17 @@ if systemctl is-active --quiet xray; then printf '%sactive%s\n' "$C_G" "$C_0"; e
 printf '  %-46s' "2. 到中转机的反向隧道连接 (ESTAB)"
 estab=""
 if command -v ss >/dev/null 2>&1; then
-  # 不用 -H（老 iproute2 会报错）；用状态字段过滤，表头的 $1 是 "State" 自然被排除
-  estab="$(ss -tnp 2>/dev/null | awk -v p="$REVERSE_PORT" '$4 ~ "[.:]"p"$" && tolower($1)=="estab"' || true)"
+  # ⚠️ 两个坑都踩过，别改回去：
+  #   ① 列号必须是 $5（Peer 列）。ss -tnp 的列是 State/Recv-Q/Send-Q/Local/Peer，
+  #      $4 是「本地」端口 —— B 侧本地是随机临时端口，永远不可能等于反向端口。
+  #      曾经写成 $4，导致隧道明明是通的，这里也永远报「未建立」。
+  #   ② xray 刚重启时隧道要几秒才建起来，直接判定会误报，这里最多等 16 秒。
+  #   不用 -H（老 iproute2 会报错）；用状态字段过滤，表头 $1 是 "State" 自然被排除。
+  for _ in 1 2 3 4 5 6 7 8; do
+    estab="$(ss -tnp 2>/dev/null | awk -v p="$REVERSE_PORT" '$5 ~ "[.:]"p"$" && tolower($1)=="estab"' || true)"
+    [[ -n "$estab" ]] && break
+    sleep 2
+  done
 fi
 if [[ -n "$estab" ]]; then printf '%s已建立%s\n' "$C_G" "$C_0"; else printf '%s未建立（可能仍在重连，稍后重跑本脚本）%s\n' "$C_Y" "$C_0"; fi
 
