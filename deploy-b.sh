@@ -204,6 +204,28 @@ fetch_vps_sh() {
   info "vps.sh 已就绪：$VPS_SH"
 }
 
+# ============================ sshd 生效端口 ============================
+# 读取 sshd 当前「生效」的端口列表（空格分隔）。
+#
+# ⚠️ 这个函数曾经在 deploy-b.sh 里**整份丢失**（删 SSH 迁移代码时被连带删掉），
+#    导致落地机一执行就报 `sshd_effective_ports: command not found` 直接中断。
+#    改 deploy-b.sh 时留意别再把工具函数跟业务代码一起删掉。
+#
+# 必须容错：本脚本开着 pipefail，如果 sshd 不在 PATH 里，
+# 管道里第一个命令返回 127 会让整个管道失败，进而被 set -e 直接中断脚本。
+sshd_effective_ports() {
+  local bin="" p=""
+  if command -v sshd >/dev/null 2>&1; then
+    bin="$(command -v sshd)"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    bin="/usr/sbin/sshd"
+  else
+    return 0
+  fi
+  p="$( { "$bin" -T 2>/dev/null || true; } | awk 'tolower($1)=="port"{print $2}' | sort -un )" || true
+  printf '%s' "$p" | tr '\n' ' ' | sed 's/ *$//'
+}
+
 # 自动挑一个 SSH 端口（避开入口端口 / 当前 SSH 端口 / 已占用端口）
 pick_ssh_port() {
   local cand="" i ssh_ports=""
@@ -409,6 +431,16 @@ listen_lines() {
   elif command -v netstat >/dev/null 2>&1; then
     netstat -tlnp 2>/dev/null | awk '$1 ~ /^tcp/ && $6=="LISTEN"' || true
   fi
+}
+
+# 判断某个端口是否已被监听。
+# ⚠️ 必须基于 listen_lines() 的「状态字段」过滤，不能写成
+#    `[[ -z "$(ss ...)" ]]` —— ss/netstat 无匹配时也会打印表头，输出永远非空。
+# ⚠️ 这个函数曾跟 SSH 迁移代码一起被误删，导致落地机执行到 pick_ssh_port 时报
+#    `port_in_use: command not found`。工具函数不要跟业务代码一起删。
+port_in_use() {
+  local port="$1"
+  [[ -n "$(listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
 }
 
 # 注：原 setup-b.sh 里的 SSHD_BIN 解析、sshd_current_ports()、ssh_migrate_stage1()
