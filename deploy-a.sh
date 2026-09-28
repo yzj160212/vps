@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy-a.sh — 服务器 A 一键部署（开荒 + 反向隧道入口端）
+# deploy-a.sh — 中转机（A）一键部署（开荒 + 反向隧道入口端）
 #
 #   = 开荒（vps.sh：SSH 加固 / fail2ban / UFW / 日志优化）
 #   + 入口端部署（VLESS+REALITY+XHTTP:443 用户入口 + 反向隧道 portal）
@@ -14,7 +14,7 @@
 #   bash deploy-a.sh --dry-run --domain a.example.com            # 只看生成的配置，不动系统
 #   bash deploy-a.sh --help
 #
-# 配套脚本：deploy-b.sh（在 B 上运行，需要本脚本输出的登记令牌）
+# 配套脚本：deploy-b.sh（在落地机 B 上运行，需要本脚本输出的登记令牌）
 #
 # 部署顺序是硬约束：A 跑完拿到令牌 -> B 才能跑。反过来无解。
 #
@@ -37,14 +37,14 @@ BOOTSTRAP_MARKER="/etc/xray-reverse/bootstrap.done"   # 开荒完成标记（用
 
 # ============================ 默认参数（第 2 步，入口端）============================
 ENTRY_PORT=443                    # 用户入口端口
-REVERSE_PORT=""                   # B 反向隧道落点端口；留空 = 部署时随机挑一个高位端口
+REVERSE_PORT=""                   # 落地机（B）反向隧道落点端口；留空 = 部署时随机挑一个高位端口
 REVERSE_PORT_MIN=20000            # 随机反向端口的取值下界
 REVERSE_PORT_MAX=60000            # 随机反向端口的取值上界
-REVERSE_DOMAIN="reverse.internal" # A/B 内部约定的虚拟域名，两边必须一致
+REVERSE_DOMAIN="reverse.internal" # 中转机/落地机内部约定的虚拟域名，两边必须一致
 NODES=1                           # 节点数量（node1..nodeN）
 REALITY_SNI="www.apple.com"       # REALITY 回落域名（实测可用，见下方 SNI 检查）
 XHTTP_PATH=""                     # 留空则自动生成
-A_ADDR=""                         # A 的域名或公网 IP（生成分享链接用）
+A_ADDR=""                         # 中转机（A）的域名或公网 IP（生成分享链接用）
 STATE_DIR="/etc/xray-reverse"
 FORCE=0
 SKIP_FIREWALL=0
@@ -72,7 +72,7 @@ hr()   { printf '%s\n' "--------------------------------------------------------
 # ============================ 用法 ============================
 usage() {
   cat <<'EOF'
-deploy-a.sh v2.0.0 — 服务器 A 一键部署（开荒 + 反向隧道入口端）
+deploy-a.sh v2.0.0 — 中转机（A）一键部署（开荒 + 反向隧道入口端）
 
 用法：
   bash deploy-a.sh --domain a.example.com
@@ -88,14 +88,14 @@ deploy-a.sh v2.0.0 — 服务器 A 一键部署（开荒 + 反向隧道入口端
   --vps-sh <路径>        指定本地 vps.sh 路径（默认自动查找，找不到就从仓库下载）
 
 第 2 步：入口端选项
-  --domain <域名或IP>    A 的公网地址 —— 客户端就是连这个。两种填法：
-                           填域名：如 a.你的域名.com（需先加一条 A 记录指向 A 的 IP）
+  --domain <域名或IP>    中转机（A）的公网地址 —— 客户端就是连这个。两种填法：
+                           填域名：如 a.你的域名.com（需先加一条 A 记录指向中转机的 IP）
                            填 IP  ：如 203.0.113.10（最省事，不用配 DNS）
-                         不填会自动探测 A 的公网 IP（可用，但域名更抗封锁）。
+                         不填会自动探测中转机的公网 IP（可用，但域名更抗封锁）。
                          不需要证书、不需要是个真网站。
                          ⚠️ 别和 --sni 搞混：--sni 才是「伪装成哪个网站」。
   --port <端口>          用户入口端口，默认 443（建议保持 443，见 README）
-  --reverse-port <端口>  B 反向隧道落点端口。不填则自动在 20000-60000 里随机挑一个
+  --reverse-port <端口>  落地机（B）反向隧道落点端口。不填则自动在 20000-60000 里随机挑一个
   --nodes <数量>         节点数量，默认 1（生成 node1..nodeN，各自独立 UUID）
   --sni <域名>           REALITY 伪装的「回落域名」，默认 www.apple.com。
                          必须是支持 TLS 1.3 + X25519 的真实大站。
@@ -495,7 +495,7 @@ gen_reality_keypair() {
   REALITY_PUBLIC="$(printf '%s\n' "$out" | grep -iE 'Password|PublicKey'      | head -n1 | strip_val)"
   [[ -n "$REALITY_PRIVATE" && -n "$REALITY_PUBLIC" ]] \
     || { err "无法解析 xray x25519 输出："; printf '%s\n' "$out" >&2; die "请手动生成 REALITY 密钥"; }
-  info "REALITY 密钥对已生成（私钥只写入 A 的配置，绝不外发）"
+  info "REALITY 密钥对已生成（私钥只写入中转机的配置，绝不外发）"
 }
 
 gen_vlessenc() {
@@ -508,9 +508,9 @@ gen_vlessenc() {
   [[ -n "$VLESS_DECRYPTION" && -n "$VLESS_ENCRYPTION" ]] \
     || { err "无法解析 xray vlessenc 输出："; printf '%s\n' "$out" >&2; die "请手动生成 VLESS Encryption 材料"; }
   if [[ "$PQ" -eq 1 ]]; then
-    info "A<->B 链路加密：ML-KEM-768（后量子）"
+    info "中转机<->落地机 链路加密：ML-KEM-768（后量子）"
   else
-    info "A<->B 链路加密：X25519"
+    info "中转机<->落地机 链路加密：X25519"
   fi
 }
 
@@ -642,7 +642,7 @@ check_a_addr_reachable() {
 
   if [[ -z "$resolved" ]]; then
     warn "无法解析 --domain ${addr} —— 这个域名现在指向不到任何地址，客户端会连不上。"
-    warn "请先加一条 A 记录指向 A 的公网 IP，例如："
+    warn "请先加一条 A 记录指向中转机的公网 IP，例如："
     warn "    ${addr}  A  <A的公网IP>"
     warn "想跳过域名直接跑，也可以改用公网 IP：--domain <A的公网IP>"
     return 0
@@ -847,7 +847,7 @@ run_bootstrap
 
 # ---- 第 2 步：入口端部署 ----
 hr
-printf '%s服务器 A（入口 / portal 端）部署%s  v%s' "$C_B" "$C_0" "$VERSION"
+printf '%s中转机（A · 入口端）部署%s  v%s' "$C_B" "$C_0" "$VERSION"
 [[ "$DRY_RUN" -eq 1 ]] && printf '  %s[dry-run]%s' "$C_Y" "$C_0"
 printf '\n'
 hr
@@ -910,7 +910,7 @@ for e in "${NODE_EMAILS[@]}"; do
   USERS_JSON+="\"$e\""
 done
 
-log "写入 A 的配置 ..."
+log "写入中转机的配置 ..."
 # 注意：不要在这里声明 tag=portal 的出站。
 # Xray 的 reverse portal 会自行注册同名出站处理器，手写一个 vless 出站
 # 既过不了配置校验（"vnext" should have one and only one member），
@@ -999,7 +999,7 @@ chmod 600 "$STATE_DIR/state.env"
 printf 'REALITY_PRIVATE=%s\nVLESS_DECRYPTION=%s\n' "$REALITY_PRIVATE" "$VLESS_DECRYPTION" > "$STATE_DIR/secrets.env"
 chmod 600 "$STATE_DIR/secrets.env"
 
-# 交付给 B 的登记令牌
+# 交付给落地机（B）的登记令牌
 TOKEN_PLAIN="$(cat <<EOF
 XRAY_REVERSE_ENROLL_V1
 A_ADDR=${A_ADDR}
@@ -1028,7 +1028,7 @@ hr
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '%s[DRY-RUN] 预演完成，未改动系统%s\n' "$C_G" "$C_0"
 else
-  printf '%s服务器 A 部署完成%s\n' "$C_G" "$C_0"
+  printf '%s中转机（A）部署完成%s\n' "$C_G" "$C_0"
 fi
 hr
 echo
@@ -1037,7 +1037,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   cat "$XRAY_CONF"
   echo
 fi
-printf '%s【第 2 步】在服务器 B 上执行（复制整行，含长令牌）%s\n' "$C_B" "$C_0"
+printf '%s【第 2 步】在落地机（B）上执行（复制整行，含长令牌）%s\n' "$C_B" "$C_0"
 echo
 printf '  bash deploy-b.sh --token %s\n' "$TOKEN"
 echo
@@ -1056,5 +1056,5 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   printf '  journalctl -u xray -n 50 --no-pager            # 看是否有报错\n'
 fi
 echo
-printf '%s注意%s：A 侧配置与防火墙%s不依赖 B 的 IP%s，B 换 IP 无需任何改动。\n' "$C_Y" "$C_0" "$C_Y" "$C_0"
+printf '%s注意%s：中转机侧配置与防火墙%s不依赖落地机的 IP%s，落地机换 IP 无需任何改动。\n' "$C_Y" "$C_0" "$C_Y" "$C_0"
 hr

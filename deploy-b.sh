@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy-b.sh — 服务器 B 一键部署（开荒 + 反向隧道出口端）
+# deploy-b.sh — 落地机（B）一键部署（开荒 + 反向隧道出口端）
 #
 #   = 开荒（vps.sh：SSH 加固 / fail2ban / UFW / 日志优化）
 #   + 出口端部署（反向隧道 bridge；inbounds 为空，对外不开任何入口）
@@ -8,13 +8,13 @@
 # 架构：用户 --> A(VLESS+REALITY+XHTTP:443) --反向隧道(B主动拨A)--> B --> Internet
 #
 # 用法：
-#   bash deploy-b.sh --token <A 输出的令牌>
+#   bash deploy-b.sh --token <中转机输出的令牌>
 #   bash deploy-b.sh --token <令牌> --ssh-port 22222 --ssh-key-file ~/.ssh/id_ed25519.pub
 #   bash deploy-b.sh --skip-bootstrap --token <令牌>          # 已经开荒过的机器
 #   bash deploy-b.sh --dry-run --token <令牌>                 # 只看生成的配置，不动系统
 #   bash deploy-b.sh --help
 #
-# 配套脚本：deploy-a.sh（在 A 上运行，产出上面那个令牌）
+# 配套脚本：deploy-a.sh（在中转机 A 上运行，产出上面那个令牌）
 #
 # 部署顺序是硬约束：必须先跑完 A 拿到令牌，再跑 B。
 #
@@ -36,12 +36,12 @@ BOOTSTRAP_YES=0              # 1 = 开荒阶段不再交互确认
 BOOTSTRAP_MARKER="/etc/xray-reverse/bootstrap.done"   # 开荒完成标记（用于识别重跑）
 
 # ============================ 默认参数（第 2 步，出口端）============================
-TOKEN=""                     # A 输出的 base64 登记令牌
+TOKEN=""                     # 中转机输出的 base64 登记令牌
 TOKEN_FILE=""                # 从文件读令牌
-A_ADDR=""                    # A 的域名或稳定 IP（不用 --token 时必填）
-REVERSE_PORT=""              # A 的反向隧道落点端口（不用 --token 时必填）
-REVERSE_DOMAIN=""            # 内部虚拟域名，须与 A 一致
-BRIDGE_UUID=""               # A 上 reverse-in 的客户端 UUID（不用 --token 时必填）
+A_ADDR=""                    # 中转机（A）的域名或稳定 IP（不用 --token 时必填）
+REVERSE_PORT=""              # 中转机的反向隧道落点端口（不用 --token 时必填）
+REVERSE_DOMAIN=""            # 内部虚拟域名，须与中转机一致
+BRIDGE_UUID=""               # 中转机上 reverse-in 的客户端 UUID（不用 --token 时必填）
 VLESS_ENCRYPTION=""          # VLESS Encryption 加密串（不用 --token 时必填）
 FORCE=0
 SKIP_INSTALL=0
@@ -67,10 +67,10 @@ hr()   { printf '%s\n' "--------------------------------------------------------
 # ============================ 用法 ============================
 usage() {
   cat <<'EOF'
-deploy-b.sh v2.0.0 — 服务器 B 一键部署（开荒 + 反向隧道出口端）
+deploy-b.sh v2.0.0 — 落地机（B）一键部署（开荒 + 反向隧道出口端）
 
 用法：
-  bash deploy-b.sh --token <A 输出的令牌>
+  bash deploy-b.sh --token <中转机输出的令牌>
   bash deploy-b.sh --skip-bootstrap --token <令牌>     # 已经开荒过的机器
 
 第 1 步：开荒选项（调用同目录的 vps.sh）
@@ -85,11 +85,11 @@ deploy-b.sh v2.0.0 — 服务器 B 一键部署（开荒 + 反向隧道出口端
 第 2 步：出口端选项
   --token <令牌>          从 deploy-a.sh 输出的登记令牌（推荐，一键打通）
   --token-file <路径>     从文件读取令牌
-  --a-addr <域名或IP>     A 的域名或稳定 IP（不用 --token 时必填）
-  --reverse-port <端口>   A 的反向隧道落点端口（不用 --token 时必填）
-  --bridge-uuid <UUID>    A 上 reverse-in 的客户端 UUID（不用 --token 时必填）
+  --a-addr <域名或IP>     中转机（A）的域名或稳定 IP（不用 --token 时必填）
+  --reverse-port <端口>   中转机的反向隧道落点端口（不用 --token 时必填）
+  --bridge-uuid <UUID>    中转机上 reverse-in 的客户端 UUID（不用 --token 时必填）
   --encryption <字符串>   VLESS Encryption 加密串（不用 --token 时必填）
-  --reverse-domain <域名> 内部虚拟域名，默认 reverse.internal（须与 A 一致）
+  --reverse-domain <域名> 内部虚拟域名，默认 reverse.internal（须与中转机一致）
   --dry-run               只生成并校验配置、打印结果，不改动系统（无需 root，且会跳过开荒）
   --force                 已存在配置时强制覆盖（会先备份）
   --skip-install          不自动安装 Xray
@@ -97,7 +97,7 @@ deploy-b.sh v2.0.0 — 服务器 B 一键部署（开荒 + 反向隧道出口端
 
 说明：1) SSH 端口加固已经由第 1 步的开荒脚本负责，所以本脚本不再提供
          「把 SSH 迁到高位端口」的选项 —— 那件事开荒时已经做完了。
-      2) B 不需要放行任何入站端口（它只主动外拨到 A），因此没有 --skip-firewall 选项。
+      2) 落地机不需要放行任何入站端口（它只主动外拨到中转机），因此没有 --skip-firewall 选项。
 
 环境变量：
   XRAY_BIN                指定 xray 可执行文件路径（--dry-run 时很有用）
@@ -514,17 +514,17 @@ validate_encryption() {
   local e="$1" b3 last
   [[ "$e" =~ ^mlkem768x25519plus\.(native|xorpub|random)\. ]] \
     || die "VLESS Encryption 串格式不对：应以 mlkem768x25519plus.native. / .xorpub. / .random. 开头。
-    请回到 A 上执行：xray vlessenc  并原样复制 \`\"encryption\"\` 后面的整串值。"
+    请回到中转机上执行：xray vlessenc  并原样复制 \`\"encryption\"\` 后面的整串值。"
 
   b3="$(printf '%s' "$e" | cut -d. -f3)"
   [[ "$b3" =~ ^([0-9]+(-[0-9]+)?s|0rtt)$ ]] \
     || die "VLESS Encryption 串第 3 段应为会话票据时长（如 600s）或 0rtt，实际是「${b3}」。
-    请回到 A 上重新复制完整的一整串。"
+    请回到中转机上重新复制完整的一整串。"
 
   last="${e##*.}"
   (( ${#last} >= 43 )) \
     || die "VLESS Encryption 串末尾的认证段疑似被截断或填错（长度 ${#last}，至少 43）。
-    请回到 A 上重新复制完整的一整串（很容易漏字符）。"
+    请回到中转机上重新复制完整的一整串（很容易漏字符）。"
 
   info "VLESS Encryption 串格式校验通过"
 }
@@ -602,7 +602,7 @@ EOF
 }
 
 # ============================ 防火墙 ============================
-# B 不需要放行任何入站端口：它是 bridge，只主动外拨到 A 的反向端口。
+# 落地机不需要放行任何入站端口：它是 bridge，只主动外拨到中转机的反向端口。
 # 出站方向默认就是放行的，所以这里刻意不做任何防火墙改动。
 # （原 setup-b.sh 的 open_port() 只在 SSH 迁移时用过，随迁移一起删掉了。）
 
@@ -613,7 +613,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 hr
-printf '%s服务器 B（AT&T 出口 / bridge 端）部署%s  v%s' "$C_B" "$C_0" "$VERSION"
+printf '%s落地机（B · 出口端）部署%s  v%s' "$C_B" "$C_0" "$VERSION"
 [[ "$DRY_RUN" -eq 1 ]] && printf '  %s[dry-run]%s' "$C_Y" "$C_0"
 printf '\n'
 hr
@@ -644,7 +644,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   fi
 fi
 
-log "写入 B 的配置 ..."
+log "写入落地机的配置 ..."
 apply_config <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -697,10 +697,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '%s生成的 B 配置（已通过 xray -test 校验）%s\n' "$C_B" "$C_0"
   cat "$XRAY_CONF"
   echo
-  printf '%s正式部署时会在 B 上额外完成：%s\n' "$C_B" "$C_0"
+  printf '%s正式部署时会在落地机上额外完成：%s\n' "$C_B" "$C_0"
   printf '  · 重启 xray 并校验 active\n'
   printf '  · 写入 /etc/systemd/system/xray.service.d/restart.conf（Restart=always, RestartSec=5）\n'
-  printf '  · 校验到 A 的反向隧道是否 ESTAB，并检查对外无多余监听\n'
+  printf '  · 校验到中转机的反向隧道是否 ESTAB，并检查对外无多余监听\n'
   hr
   exit 0
 fi
@@ -713,7 +713,7 @@ ok=1
 printf '  %-46s' "1. xray 服务状态"
 if systemctl is-active --quiet xray; then printf '%sactive%s\n' "$C_G" "$C_0"; else printf '%s未运行%s\n' "$C_R" "$C_0"; ok=0; fi
 
-printf '  %-46s' "2. 到 A 的反向隧道连接 (ESTAB)"
+printf '  %-46s' "2. 到中转机的反向隧道连接 (ESTAB)"
 estab=""
 if command -v ss >/dev/null 2>&1; then
   # 不用 -H（老 iproute2 会报错）；用状态字段过滤，表头的 $1 是 "State" 自然被排除
@@ -734,7 +734,7 @@ if grep -q '"inbounds": \[\]' "$XRAY_CONF"; then printf '%s是%s\n' "$C_G" "$C_0
 
 echo
 if [[ "$ok" -eq 1 ]]; then
-  printf '%s服务器 B 部署完成%s\n' "$C_G" "$C_0"
+  printf '%s落地机（B）部署完成%s\n' "$C_G" "$C_0"
 else
   printf '%s部署完成，但有检查项未通过，请看上面标记%s\n' "$C_Y" "$C_0"
 fi
@@ -742,6 +742,6 @@ hr
 printf '出口 IP 自检（应与本机公网 IP 一致）：\n'
 curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null | sed 's/^/    /' || printf '    （无法访问外网，请手动检查）\n'
 echo
-printf '%s换 IP 后无需任何操作%s：隧道由 B 主动外拨到 A 的域名，断线会自动重连。\n' "$C_B" "$C_0"
+printf '%s换 IP 后无需任何操作%s：隧道由落地机主动外拨到中转机的域名，断线会自动重连。\n' "$C_B" "$C_0"
 printf '如需手动验证重连：systemctl restart xray 后 30 秒内重跑本脚本查看第 2 项。\n'
 hr
