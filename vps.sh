@@ -396,6 +396,82 @@ restart_ssh() {
     fi
 }
 
+# 函数：把 jail.local 中 [sshd] 段的 port 设成指定端口
+# 用 awk 按「当前处于哪个段」来定位，不依赖空格数量，避免静默替换失败。
+set_fail2ban_port() {
+    local port="$1" f=/etc/fail2ban/jail.local tmp
+    [ -f "$f" ] || return 1
+    tmp="$(mktemp)"
+    awk -v p="$port" '
+        /^[[:space:]]*\[/ { in_sshd = ($0 ~ /^[[:space:]]*\[sshd\]/) }
+        in_sshd && /^[[:space:]]*port[[:space:]]*=/ { print "port    = " p; next }
+        { print }
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+    grep -qE "^[[:space:]]*port[[:space:]]*=[[:space:]]*${port}[[:space:]]*$" "$f"
+}
+
+# 函数：fail2ban 部署后自检
+# 为什么必须自检：fail2ban 最典型的失败模式是「服务正常启动、但完全不封禁」，
+# 常见原因有两个，而且都不报错：
+#   ① jail.local 里的 port 不是真实 SSH 端口 → 封禁规则打到 22 上，等于没封；
+#   ② filter 模式用了默认的 normal → 禁用密码登录后，密钥爆破的日志不计入失败。
+# 只能靠实测发现，所以这里用一个保留地址试封一次，直接看 iptables 规则落在哪个端口。
+verify_fail2ban() {
+    local ssh_port="$1" testip="203.0.113.1" rule="" ok=1
+
+    print_info "fail2ban 自检..."
+
+    if ! systemctl is-active --quiet fail2ban; then
+        print_error "  ✗ fail2ban 服务未运行"
+        return 1
+    fi
+    print_info "  ✓ 服务运行中"
+
+    if ! fail2ban-client status sshd >/dev/null 2>&1; then
+        print_error "  ✗ sshd jail 未加载"
+        return 1
+    fi
+    print_info "  ✓ sshd jail 已加载"
+
+    # 用 TEST-NET-3 保留地址试封，不会影响任何真实用户，测完立刻解封
+    fail2ban-client set sshd banip "$testip" >/dev/null 2>&1
+    sleep 1
+    rule="$(iptables -S 2>/dev/null | grep -m1 'dports')"
+    fail2ban-client set sshd unbanip "$testip" >/dev/null 2>&1
+
+    if printf '%s' "$rule" | grep -q -- "--dports ${ssh_port}"; then
+        print_info "  ✓ 封禁规则指向正确端口 ${ssh_port}"
+    else
+        print_error "  ✗ 封禁规则没有指向 ${ssh_port}"
+        print_error "    实际规则：${rule:-（未生成）}"
+        print_error "    → 这就是「fail2ban 正常启动但毫无保护」的典型症状，请检查 jail.local 的 port"
+        ok=0
+    fi
+
+    # filter 模式检查。
+    # 必须显式写成 filter = sshd[mode=aggressive] 或 [mode=ddos]。
+    # ⚠️ 写成单独一行 "mode = aggressive" 是**无效**的 —— fail2ban 不会把 jail 级的
+    #    mode 选项转发给 filter（filter 文件里那句"在 jail 里写 mode = extra"的注释是错的）。
+    #    实测：单独写 mode = aggressive 时识别 0 次；写成 sshd[mode=aggressive] 识别 4 次。
+    if grep -qE '^[[:space:]]*filter[[:space:]]*=[[:space:]]*sshd\[mode=(aggressive|ddos)\]' /etc/fail2ban/jail.local 2>/dev/null; then
+        print_info "  ✓ filter 模式已覆盖密钥爆破场景"
+    else
+        print_warning "  ! sshd 的 filter 没有指定 mode=aggressive/ddos"
+        print_warning "    本机已禁用密码登录，攻击者只能试密钥；默认的 normal 模式不计入"
+        print_warning "    「预认证阶段断开连接」，等于密钥爆破永远不会被封禁。"
+        print_warning "    正确写法：filter = sshd[mode=aggressive]"
+        print_warning "    注意：单独写一行 mode = aggressive 是无效的，必须写在 filter 的方括号里。"
+        ok=0
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        print_info "  ✓ fail2ban 自检通过"
+    else
+        print_warning "  ! fail2ban 自检发现问题，见上面标记"
+    fi
+    return 0
+}
+
 # 函数：配置 fail2ban
 configure_fail2ban() {
     local ssh_port="$1"
@@ -458,8 +534,15 @@ EOF
         print_info "fail2ban 配置文件下载成功"
         
         # 修改配置文件中的 SSH 端口
-        sed -i "s/port = ssh/port = $ssh_port/" /etc/fail2ban/jail.local
-        print_info "fail2ban SSH 端口已更新为: $ssh_port"
+        # ⚠️ 早先这里写的是 sed "s/port = ssh/..."，只认「单空格」。
+        #    配置文件里一旦对齐成 "port    = ssh" 就替换失败 —— 而失败是静默的，
+        #    结果是 fail2ban 把封禁规则打到 22 端口上：服务看着完全正常，
+        #    对真实 SSH 端口却毫无保护。改用按段定位、容忍任意空白的写法。
+        if set_fail2ban_port "$ssh_port"; then
+            print_info "fail2ban SSH 端口已更新为: $ssh_port"
+        else
+            print_error "fail2ban 的 SSH 端口未能设为 $ssh_port —— 封禁会打到错误端口上！"
+        fi
         
         # 验证下载的配置文件
         if ! fail2ban-client -t 2>/dev/null; then
@@ -471,6 +554,15 @@ EOF
         create_fallback_config
     fi
     
+    # 设置 IPv6 支持。
+    # ⚠️ allowipv6 是 fail2ban「主配置」的选项，不是 jail 的选项。
+    #    写进 jail.local 只会得到一句 WARNING 且完全不生效（实测过）。
+    #    写到 fail2ban.local 覆盖主配置，不动包管理的 fail2ban.conf。
+    #    不设的话每次 fail2ban-client -t 都会抱怨：
+    #      WARNING 'allowipv6' not defined in 'Definition'. Using default one: 'auto'
+    #    （默认值就是 auto，功能上没影响，只是噪音）
+    printf '[Definition]\nallowipv6 = auto\n' > /etc/fail2ban/fail2ban.local
+
     # 验证配置文件
     print_info "验证 fail2ban 配置..."
     if ! fail2ban-client -t 2>/dev/null; then
@@ -860,6 +952,7 @@ main() {
     # 配置 fail2ban
     if configure_fail2ban "$SSH_PORT"; then
         print_info "fail2ban 配置完成"
+        verify_fail2ban "$SSH_PORT"
     else
         print_warning "fail2ban 配置可能有问题，但脚本继续执行"
     fi

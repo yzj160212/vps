@@ -290,6 +290,97 @@ ufw status | grep -E "443|${RP}"
 
 ---
 
+## ⚠️ fail2ban：三个会让它「启动正常但完全不封禁」的坑
+
+fail2ban 最坑的地方是**失败是静默的**：服务 active、jail 已加载、日志无报错，
+但攻击者怎么爆破都不被封。真机上逐项验证过，三个坑如下。
+
+### 坑 1：filter 模式用了默认的 `normal`（最关键）
+
+本套配置**禁用了密码登录**，攻击者只能试密钥。客户端试密钥时先发"查询"不签名，
+sshd 直接拒绝、**不会记录 `Failed publickey`**，只在连接结束时留下：
+
+```
+Connection closed by authenticating user root <IP> port N [preauth]
+```
+
+而 `normal` 模式把这一行标成 `<F-NOFAIL>`（不计入失败）→ **用真实用户名爆破密钥永远不会被封禁**。
+
+实测（同一份 journal）：
+
+| 模式 | 匹配到的行数 |
+| --- | --- |
+| `normal`（默认） | **0** ❌ |
+| `aggressive` | **8** ✅（日志里总共就 8 条） |
+
+**正确写法：`filter = sshd[mode=aggressive]`**
+
+⚠️ **写成单独一行 `mode = aggressive` 是无效的** —— fail2ban 不会把 jail 级的 `mode`
+转发给 filter。虽然 filter 文件自己的注释里写着「在 jail 里写 `mode = extra`」，
+但那是错的。真机 A/B 实测（各发 4 次错误密钥）：
+
+| 写法 | 识别到失败次数 |
+| --- | --- |
+| `filter = sshd` + 单独一行 `mode = aggressive` | **0** ❌ |
+| `filter = sshd[mode=aggressive]` | **4** ✅ |
+| `filter = sshd[mode=ddos]` | **4** ✅ |
+
+### 坑 2：jail.local 里的 `port` 没被改成真实 SSH 端口
+
+开荒脚本会把 SSH 端口改掉，jail.local 里必须同步，否则封禁规则会打到 **22 端口**上 ——
+22 上根本没有服务，等于完全没保护。
+
+早先的实现是 `sed -i "s/port = ssh/port = $ssh_port/"`，**只认单空格**。
+配置文件里一旦对齐成 `port    = ssh` 就静默替换失败。现在改成按段定位、容忍任意空白，
+并在替换后校验，失败会强制写入 + 报错。
+
+### 坑 3：`allowipv6` 写错了位置
+
+`allowipv6` 是 **fail2ban 主配置**的选项，不是 jail 的选项。
+写进 `jail.local` 的全局段只会得到一句 WARNING，而且完全不生效。
+正确做法是写进 `/etc/fail2ban/fail2ban.local`：
+
+```ini
+[Definition]
+allowipv6 = auto
+```
+
+（IPv6 封禁本身不需要额外配置 —— `banaction` 会自动同时写 `iptables` 和 `ip6tables`，
+实测封禁 IPv6 地址时 ip6tables 规则正常生成。）
+
+### 开荒脚本内置了自检
+
+`vps.sh` 装完 fail2ban 后会跑 `verify_fail2ban()`：
+
+1. 服务是否 active、jail 是否加载
+2. **用一个保留地址（`203.0.113.1`）试封一次**，直接看 iptables 规则落在哪个端口
+   —— 端口不对就报警（这是「服务正常但不保护」的典型症状）
+3. 检查 `filter` 那一行是否写成了 `sshd[mode=aggressive]` 或 `[mode=ddos]`
+
+装完请留意这几行输出，有问题会明确告诉你。
+
+### 自己手动验证 fail2ban 是否真的在工作
+
+最直接的办法：把**你自己的 IP 加进白名单**（这样不会被封），然后故意用错密钥登录几次，
+再看 fail2ban 日志有没有识别到。
+
+```bash
+# 在服务器上：先把自己加白名单
+fail2ban-client set sshd addignoreip <你的IP>
+
+# 然后从你本机故意用错误密钥登录 3~4 次
+ssh -i /path/to/wrong_key -p <SSH端口> root@<服务器IP> exit
+
+# 回服务器看日志：出现 "Ignore <你的IP> by ip" 就说明识别成功
+#（Ignore 是在正则匹配之后才记录的，所以有它 = 匹配成功）
+tail -10 /var/log/fail2ban.log
+
+# 测完记得把白名单去掉
+fail2ban-client set sshd delignoreip <你的IP>
+```
+
+---
+
 ## 常用参数
 
 ### 开荒部分（`deploy-a.sh` 和 `deploy-b.sh` 都有）
