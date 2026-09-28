@@ -143,7 +143,7 @@ XRAY_BIN=/usr/local/bin/xray bash deploy-b.sh --dry-run --token <令牌>
 这两个都是「域名」，但角色完全相反。看生成的分享链接就清楚了：
 
 ```
-vless://eae648e3-...@a.example.com:443?...&sni=www.microsoft.com&...
+vless://eae648e3-...@a.example.com:443?...&sni=www.apple.com&...
                    ↑ --domain                  ↑ --sni
               客户端要连的地址            客户端伪装成访问哪个站
 ```
@@ -151,9 +151,9 @@ vless://eae648e3-...@a.example.com:443?...&sni=www.microsoft.com&...
 | 参数 | 作用 | 填什么 |
 | --- | --- | --- |
 | `--domain` | **客户端要连的地址** | 你自己的域名（需 A 记录指向 A 的 IP）或 A 的公网 IP |
-| `--sni` | **伪装成访问哪个网站** | 一个支持 TLS 1.3 的真实大站，默认 `www.microsoft.com`，一般不用改 |
+| `--sni` | **伪装成访问哪个网站** | 一个真正能握手成功的国外大站，默认 `www.apple.com`。⚠️ 见下文专节，**不要照抄教程** |
 
-`--sni` 跟你的服务器、你的域名**没有任何关系** —— 它只是让流量看起来像在访问微软官网。
+`--sni` 跟你的服务器、你的域名**没有任何关系** —— 它只是让流量看起来像在访问苹果官网。
 
 ### 脚本会自动帮你检查 `--domain`
 
@@ -166,6 +166,64 @@ vless://eae648e3-...@a.example.com:443?...&sni=www.microsoft.com&...
   2. 域名挂在 **Cloudflare 代理（橙云）** 后面 —— REALITY 必须直连，要改成「仅 DNS」（灰云）
 
 看到警告不等于一定错（NAT、弹性 IP 等情况下也会提示），确认没问题就忽略。
+
+---
+
+## ⚠️ `--sni` 回落域名必须实测可用（踩过大坑）
+
+**这条不是「随便填个大站就行」。填错的话整条链路全废，而且表面上一切正常。**
+
+### 为什么会这样
+
+REALITY 的握手原理是：服务端把**客户端的 uTLS ClientHello 转发给回落域名**，
+拿回 ServerHello 后再接管连接。所以这个域名能不能用，取决于
+**它是否接受你这个客户端指纹的 ClientHello** —— 不是「能不能 TLS 握手」这么简单。
+
+### 实测结果（同一台机器、同一套密钥，只换域名）
+
+| 回落域名 | 结果 |
+| --- | --- |
+| `www.microsoft.com` | ❌ **REALITY 握手失败** |
+| `www.apple.com` | ✅ 可用（**当前默认值**） |
+| `www.cloudflare.com` | ✅ 可用 |
+| `www.bing.com` | ✅ 可用 |
+| `www.lovelive-anime.jp` | ✅ 可用 |
+
+`www.microsoft.com` 由 Akamai 承载，不接受该指纹的 ClientHello，服务端会报：
+
+```
+REALITY: processed invalid connection ... handshake did not complete successfully
+```
+
+而客户端只能看到 `failed to POST ... EOF` —— **完全看不出是域名的问题**。
+配置语法、密钥对、端口、服务状态、防火墙全都「正常」，极难排查。
+
+### ⚠️ 别用 openssl 去「验证」域名
+
+`openssl s_client -connect www.microsoft.com:443 -tls1_3` 是**成功**的
+（返回 `Verify return code: 0`），但 REALITY 依然失败 —— 因为 openssl 发的是
+它自己的 ClientHello，跟客户端的 uTLS 指纹不是一回事。
+**openssl 能连上 ≠ REALITY 能用。**
+
+### 脚本怎么帮你
+
+`deploy-a.sh` 在部署完成后会自动跑一次 **REALITY 自检**：
+用刚生成的密钥在本机起两个临时实例（服务端 + 客户端，只监听 `127.0.0.1` 高位端口），
+真跑一遍 REALITY 握手并出网。**全程不碰运行中的 xray 服务。**
+
+- 通过 → `[+] REALITY 自检通过（回落域名 xxx 可用）`
+- 失败 → 打印醒目警告 + 服务端报错 + 可用域名列表
+
+想跳过自检用 `--skip-sni-check`（不推荐）。
+
+### 想换回落域名
+
+```bash
+bash <(curl -fsSL vps-yy.vercel.app/a) --domain <A的地址> --sni www.cloudflare.com --force
+```
+
+选域名的原则：**国外、大站、不跳转、支持 TLS 1.3 + X25519 + H2**。
+换完一定看自检结果。
 
 ---
 
@@ -256,7 +314,7 @@ ufw status | grep -E "443|${RP}"
 | `--port` | 用户入口端口 | `443` |
 | `--reverse-port` | B 反向隧道落点端口 | `20000-60000` 内随机 |
 | `--nodes` | 节点数量，生成 `node1..nodeN`，各自独立 UUID | `1` |
-| `--sni` | REALITY **伪装成**访问哪个站（需支持 TLS 1.3），与 `--domain` 无关 | `www.microsoft.com` |
+| `--sni` | REALITY **伪装成**访问哪个站。**必须实测可用**，见下文专节 | `www.apple.com` |
 | `--path` | XHTTP path | 自动生成随机路径 |
 | `--pq` | 用 ML-KEM-768 后量子 VLESS Encryption | X25519 |
 | `--dry-run` / `--force` / `--skip-firewall` / `--skip-install` | 见下文 | 关 |
@@ -385,7 +443,7 @@ cat /etc/xray-reverse/bootstrap.done      # 里面记着 ssh_port=...
 它唯一的作用是让客户端解析到 A 的 IP。证书那件事由 `--sni` 负责伪装。
 
 **`--domain` 和 `--sni` 有什么区别？**
-`--domain` 是**你要连的地址**（你的服务器），`--sni` 是**伪装成访问哪个网站**（比如微软官网）。
+`--domain` 是**你要连的地址**（你的服务器），`--sni` 是**伪装成访问哪个网站**（比如苹果官网）。
 前者跟你的机器绑定，后者跟你的机器毫无关系。看分享链接里 `@host:port` 和 `sni=` 就清楚了。
 
 **能不能 A、B 两台同时一键装？**
@@ -479,12 +537,24 @@ Xray 部分已在 **Xray-core 26.3.27** 上做过真实端到端验证（同机�
 | 合并后令牌→A配置→B配置 端口一致性 | 通过 |
 | 旧 `setup-*.sh` 自引用已全部清理 | 通过 |
 
-> 未在开发机验证的两项，需要在真机上确认：
-> 1. **REALITY 回落域名握手** —— 开发机装有 TUN 模式代理，会把 `www.microsoft.com`
->    解析成 fake-IP（`198.18.x.x`）导致回落握手失败。改用本地 TLS 目标后握手一次通过，
->    证明配置本身正确。在干净公网服务器上按上面的 `openssl s_client` 检查一次即可。
-> 2. **开荒部分（`vps.sh`）** —— 只能跑在 Debian 12 上，开发机是 macOS，
->    所以只验证了参数解析与守卫逻辑，`apt`/`ufw`/`fail2ban` 那部分需要你在真机上首跑确认。
+### 真机验证（Debian 12 / Xray 26.3.27，2026-09-28）
+
+在真实 VPS（Debian 12 bookworm, x86_64）上完整跑通，并做了同机三实例端到端：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 开荒（`vps.sh`）：SSH 改端口 / 禁用密码登录 / fail2ban / UFW / 日志优化 | 通过 |
+| `deploy-a.sh` 全流程（含端口检查、随机端口、写配置、重启） | 通过 |
+| REALITY 回落伪装（探测者看到的是真苹果证书） | 通过 |
+| **REALITY 自检（`selftest_reality`）** | 通过 |
+| 端到端：客户端 → A(REALITY+XHTTP) → 反向隧道 → B → 出网 | 通过（HTTPS 200，DNS 通） |
+| B 侧零监听 | 通过 |
+| 令牌 / A 配置 / B 配置 端口三处一致 | 通过 |
+| **`www.microsoft.com` 作回落域名** | ❌ 失败（已改默认值，见上文专节） |
+
+> 顺带记录：排查过程中发现并修复了两个只在真机才会暴露的问题 ——
+> `ss` 表头导致端口误判（`check_port_free`）、以及上面的回落域名问题。
+> 两者共同点是「表面全正常、实际不可用」，所以现在都加了真实验证环节。
 
 ---
 
