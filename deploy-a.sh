@@ -42,7 +42,7 @@ REVERSE_PORT_MIN=20000            # 随机反向端口的取值下界
 REVERSE_PORT_MAX=60000            # 随机反向端口的取值上界
 REVERSE_DOMAIN="reverse.internal" # A/B 内部约定的虚拟域名，两边必须一致
 NODES=1                           # 节点数量（node1..nodeN）
-REALITY_SNI="www.microsoft.com"   # REALITY 回落域名
+REALITY_SNI="www.apple.com"       # REALITY 回落域名（实测可用，见下方 SNI 检查）
 XHTTP_PATH=""                     # 留空则自动生成
 A_ADDR=""                         # A 的域名或公网 IP（生成分享链接用）
 STATE_DIR="/etc/xray-reverse"
@@ -51,6 +51,7 @@ SKIP_FIREWALL=0
 SKIP_INSTALL=0
 DRY_RUN=0
 PQ=0                              # 1=使用 ML-KEM-768（后量子）VLESS Encryption
+SKIP_SNI_CHECK=0                  # 1=跳过 --sni 回落域名兼容性检查
 
 # 允许用 XRAY_BIN 指定 xray 可执行文件（便于 --dry-run 在任意机器上预演）
 XRAY_BIN="${XRAY_BIN:-}"
@@ -136,6 +137,7 @@ while [[ $# -gt 0 ]]; do
     --reverse-port)   REVERSE_PORT="${2:-}";    shift; [[ $# -gt 0 ]] && shift || true ;;
     --nodes)          NODES="${2:-}";           shift; [[ $# -gt 0 ]] && shift || true ;;
     --sni)            REALITY_SNI="${2:-}";     shift; [[ $# -gt 0 ]] && shift || true ;;
+    --skip-sni-check) SKIP_SNI_CHECK=1; shift ;;
     --path)           XHTTP_PATH="${2:-}";      shift; [[ $# -gt 0 ]] && shift || true ;;
     --pq)             PQ=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
@@ -655,6 +657,88 @@ check_a_addr_reachable() {
   return 0
 }
 
+# ============================ REALITY 端到端自检 ============================
+# 为什么必须真测：
+#   REALITY 是「把客户端的 uTLS ClientHello 转发给回落域名，拿回 ServerHello」。
+#   所以某个域名能不能用，取决于它是否接受**该客户端指纹的 ClientHello** ——
+#   openssl 自己的握手能成功，完全不代表 REALITY 能成功。
+#   实测：www.microsoft.com（Akamai 承载）openssl 握手正常，但 REALITY 必失败：
+#       REALITY: processed invalid connection ... handshake did not complete successfully
+#   而客户端只看到 EOF / 连不上，配置、密钥、端口全都「正常」，极难排查。
+#
+# 做法：用刚生成的密钥起**两个独立实例**（服务端 + 客户端，端口都在高位、只监听
+# 127.0.0.1），走一遍真实的 REALITY 握手 + 出网。全程不碰运行中的 xray 服务。
+selftest_reality() {
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  [[ "$SKIP_SNI_CHECK" -eq 1 ]] && { info "已跳过 REALITY 自检（--skip-sni-check）"; return 0; }
+  command -v timeout >/dev/null 2>&1 || { info "系统无 timeout，跳过 REALITY 自检"; return 0; }
+
+  local dir srv cli sport sportc rc=0
+  dir="$(mktemp -d)"
+  srv="$dir/srv.json"; cli="$dir/cli.json"
+  sport=18443; sportc=18444
+
+  cat > "$srv" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [ { "tag":"t","listen":"127.0.0.1","port":${sport},"protocol":"vless",
+    "settings":{"clients":[{"id":"${NODE_UUIDS[0]}","email":"selftest"}],"decryption":"none"},
+    "streamSettings":{"network":"raw","security":"reality",
+      "realitySettings":{"target":"${REALITY_SNI}:443","serverNames":["${REALITY_SNI}"],
+        "privateKey":"${REALITY_PRIVATE}","shortIds":["${SHORT_ID}"]}} } ],
+  "outbounds": [ { "tag":"f","protocol":"freedom" } ]
+}
+EOF
+
+  cat > "$cli" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [ { "tag":"s","listen":"127.0.0.1","port":${sportc},"protocol":"socks","settings":{"udp":false} } ],
+  "outbounds": [ { "tag":"p","protocol":"vless",
+    "settings":{"vnext":[{"address":"127.0.0.1","port":${sport},
+      "users":[{"id":"${NODE_UUIDS[0]}","encryption":"none","level":0}]}]},
+    "streamSettings":{"network":"raw","security":"reality",
+      "realitySettings":{"serverName":"${REALITY_SNI}","fingerprint":"chrome",
+        "publicKey":"${REALITY_PUBLIC}","shortId":"${SHORT_ID}"}} } ]
+}
+EOF
+
+  if ! test_xray_config "$srv" || ! test_xray_config "$cli"; then
+    rm -rf "$dir"; warn "自检配置未通过校验，跳过自检"; return 0
+  fi
+
+  "$XRAY_BIN" run -config "$srv" > "$dir/srv.log" 2>&1 &
+  local ps=$!
+  sleep 2
+  "$XRAY_BIN" run -config "$cli" > "$dir/cli.log" 2>&1 &
+  local pc=$!
+  sleep 2
+
+  if timeout 20 curl -s -o /dev/null --max-time 15 -x "socks5h://127.0.0.1:${sportc}" https://api.ipify.org 2>/dev/null; then
+    rc=0
+  else
+    rc=1
+  fi
+  kill $ps $pc 2>/dev/null; wait $ps $pc 2>/dev/null
+
+  if [[ "$rc" -eq 0 ]]; then
+    log "REALITY 自检通过（回落域名 ${REALITY_SNI} 可用）"
+  else
+    warn "════════════════════════════════════════════════════════"
+    warn "REALITY 自检失败！回落域名「${REALITY_SNI}」无法完成 REALITY 握手。"
+    warn "服务端报错：$(grep -m1 'REALITY' "$dir/srv.log" 2>/dev/null || echo '（无）')"
+    warn ""
+    warn "这条链路现在是坏的，但表面上一切「正常」—— 客户端只会连不上。"
+    warn "请换一个回落域名重跑，实测可用："
+    warn "    --sni www.apple.com     （当前默认值）"
+    warn "    --sni www.cloudflare.com"
+    warn "    --sni www.bing.com"
+    warn "════════════════════════════════════════════════════════"
+  fi
+  rm -rf "$dir"
+  return 0
+}
+
 # ============================ 配置写入 ============================
 test_xray_config() {
   local f="$1" out=""
@@ -703,6 +787,9 @@ apply_config() {
   sleep 1
   systemctl is-active --quiet xray || die "xray 未处于 active 状态，请查看：journalctl -u xray -n 50"
   log "xray 已重启并处于 active"
+
+  # 配置已生效，做一次真实的 REALITY 自检
+  selftest_reality
 }
 
 # ============================ 防火墙 ============================
