@@ -4,6 +4,16 @@
       "source": "/",
       "destination": "https://raw.githubusercontent.com/yzj160212/vps/main/vps.sh",
       "permanent": true
+    },
+    {
+      "source": "/a",
+      "destination": "https://raw.githubusercontent.com/yzj160212/vps/main/deploy-a.sh",
+      "permanent": true
+    },
+    {
+      "source": "/b",
+      "destination": "https://raw.githubusercontent.com/yzj160212/vps/main/deploy-b.sh",
+      "permanent": true
     }
   ]
 }

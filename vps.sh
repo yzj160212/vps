@@ -42,6 +42,157 @@ check_command() {
     fi
 }
 
+# ============================================================================
+# 非交互模式支持（由 deploy-a.sh / deploy-b.sh 调用时使用）
+# ----------------------------------------------------------------------------
+# 设计原则：不传任何参数 = 行为与原来完全一致（纯交互式）。
+# 这样 deploy-*.sh 可以无人值守调用，而 vps.sh 单独用也照旧。
+# ============================================================================
+VPS_SSH_PORT="${VPS_SSH_PORT:-}"
+VPS_SSH_PUBLIC_KEY="${VPS_SSH_PUBLIC_KEY:-}"
+VPS_SSH_KEY_FILE="${VPS_SSH_KEY_FILE:-}"
+VPS_ASSUME_YES="${VPS_ASSUME_YES:-0}"
+VPS_NO_REBOOT="${VPS_NO_REBOOT:-0}"
+VPS_FORCE_REBOOT="${VPS_FORCE_REBOOT:-0}"
+VPS_SKIP_DEBIAN_CHECK="${VPS_SKIP_DEBIAN_CHECK:-0}"
+
+# 从终端读一行。
+# 为什么不用裸 read：`curl ... | bash` 时 bash 自己正在从 stdin 读脚本，
+# 如果脚本里的 read 也去读 stdin，会把还没执行的脚本文本吃掉 —— 灾难。
+# 所以 stdin 不是终端时，一律改从 /dev/tty 读。
+vps_read_tty() {
+    local __var="$1" __prompt="$2" __val=""
+    if [[ -t 0 ]]; then
+        printf '%s' "$__prompt" >&2
+        IFS= read -r __val || __val=""
+    elif [[ -r /dev/tty ]]; then
+        printf '%s' "$__prompt" >&2
+        IFS= read -r __val < /dev/tty || __val=""
+    else
+        # 既没有终端也没有 stdin —— 交给调用方按默认值处理
+        printf '%s' "$__prompt" >&2
+        __val=""
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
+# 是否具备「能问用户」的条件
+vps_can_ask() {
+    [[ -t 0 || -r /dev/tty ]]
+}
+
+# 确认对话框。--yes 时直接返回 0；无法询问时返回 1（调用方决定默认动作）
+vps_confirm() {
+    local prompt="$1" ans=""
+    if [[ "$VPS_ASSUME_YES" == "1" ]]; then
+        return 0
+    fi
+    if ! vps_can_ask; then
+        return 1
+    fi
+    vps_read_tty ans "${prompt} (y/N): "
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# 校验 SSH 公钥格式与长度。合法返回 0，非法返回 1（并打印原因）。
+# 抽成函数是为了让「交互输入」和「命令行/文件指定」两条路径共用同一套规则，
+# 避免以后只改一处造成行为不一致。
+vps_pubkey_valid() {
+    local key="$1" key_length="" key_type=""
+    if [[ -z "$key" ]]; then
+        print_error "SSH 公钥为空"
+        return 1
+    fi
+    if [[ ! "$key" =~ ^ssh-(rsa|dss|ecdsa|ed25519)[[:space:]]+[A-Za-z0-9+/]+=*[[:space:]]*.*$ ]]; then
+        print_error "SSH 公钥格式无效，公钥应该以 'ssh-rsa', 'ssh-ed25519', 'ssh-ecdsa' 等开头"
+        return 1
+    fi
+    key_length=${#key}
+    key_type=$(echo "$key" | awk '{print $1}')
+    case "$key_type" in
+        "ssh-ed25519")
+            if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 200 ]; then
+                print_info "SSH ed25519 公钥验证通过"
+                return 0
+            fi
+            print_error "SSH ed25519 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+            return 1
+            ;;
+        "ssh-rsa")
+            if [ "$key_length" -gt 200 ] && [ "$key_length" -lt 1000 ]; then
+                print_info "SSH RSA 公钥验证通过"
+                return 0
+            fi
+            print_error "SSH RSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+            return 1
+            ;;
+        "ssh-ecdsa")
+            if [ "$key_length" -gt 100 ] && [ "$key_length" -lt 500 ]; then
+                print_info "SSH ECDSA 公钥验证通过"
+                return 0
+            fi
+            print_error "SSH ECDSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+            return 1
+            ;;
+        *)
+            if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 1000 ]; then
+                print_info "SSH 公钥验证通过"
+                return 0
+            fi
+            print_error "SSH 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
+            return 1
+            ;;
+    esac
+}
+
+# 解析 sshd 可执行文件路径（/usr/sbin 不一定在 PATH 里）
+vps_sshd_bin() {
+    if command -v sshd >/dev/null 2>&1; then
+        command -v sshd
+    elif [[ -x /usr/sbin/sshd ]]; then
+        printf '%s' /usr/sbin/sshd
+    else
+        printf '%s' ""
+    fi
+}
+
+vps_usage() {
+    cat <<'EOF'
+vps.sh — Debian 12 VPS 开荒脚本（SSH 加固 + fail2ban + UFW + 日志优化）
+
+不传任何参数时：完全交互式，行为和以前一样。
+
+非交互参数（供 deploy-a.sh / deploy-b.sh 调用）：
+  --ssh-port <端口>      直接指定 SSH 端口，跳过交互提问（1024-65535）
+  --ssh-key <公钥串>     直接指定 SSH 公钥，跳过交互提问
+  --ssh-key-file <路径>  从文件读取 SSH 公钥
+  --yes                  所有确认一律回答「是」（无人值守）
+  --no-reboot            结束时不要重启（deploy-*.sh 默认使用，避免打断后续步骤）
+  --reboot               结束时强制重启
+  --skip-debian-check    跳过「非 Debian 12」的确认提示
+  -h, --help             显示本帮助
+
+对应环境变量：
+  VPS_SSH_PORT  VPS_SSH_PUBLIC_KEY  VPS_SSH_KEY_FILE
+  VPS_ASSUME_YES=1  VPS_NO_REBOOT=1  VPS_FORCE_REBOOT=1  VPS_SKIP_DEBIAN_CHECK=1
+EOF
+}
+
+# 参数解析：只在顶层消费参数，main() 本身不接参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ssh-port)          VPS_SSH_PORT="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
+        --ssh-key)           VPS_SSH_PUBLIC_KEY="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
+        --ssh-key-file)      VPS_SSH_KEY_FILE="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
+        --yes|-y)            VPS_ASSUME_YES=1; shift ;;
+        --no-reboot)         VPS_NO_REBOOT=1; shift ;;
+        --reboot)            VPS_FORCE_REBOOT=1; VPS_NO_REBOOT=0; shift ;;
+        --skip-debian-check) VPS_SKIP_DEBIAN_CHECK=1; shift ;;
+        -h|--help)           vps_usage; exit 0 ;;
+        *)                   print_error "未知参数：$1"; vps_usage; exit 1 ;;
+    esac
+done
+
 # 函数：检查是否为 root 用户
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -89,10 +240,14 @@ check_disk_space() {
         print_info "可以运行以下命令清理："
         print_info "sudo apt clean && sudo apt autoclean"
         print_info "sudo journalctl --vacuum-size=50M"
-        read -p "是否继续执行？(y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [[ "$VPS_ASSUME_YES" == "1" ]]; then
+            print_warning "已指定 --yes，忽略磁盘空间警告继续执行"
+        else
+            local __ans=""
+            vps_read_tty __ans "是否继续执行？(y/N): "
+            if [[ ! "$__ans" =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
         fi
     fi
 }
@@ -112,6 +267,10 @@ check_network() {
 
 # 函数：检查系统版本
 check_debian_version() {
+    if [[ "$VPS_SKIP_DEBIAN_CHECK" == "1" ]]; then
+        print_warning "已指定 --skip-debian-check，跳过发行版检查"
+        return 0
+    fi
     if [ -f /etc/debian_version ]; then
         debian_version=$(cat /etc/debian_version)
         print_info "检测到 Debian 版本: $debian_version"
@@ -121,10 +280,14 @@ check_debian_version() {
             print_info "确认为 Debian 12，继续执行..."
         else
             print_warning "此脚本专为 Debian 12 优化，当前版本可能存在兼容性问题"
-            read -p "是否继续执行？(y/N): " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                exit 1
+            if [[ "$VPS_ASSUME_YES" == "1" ]]; then
+                print_warning "已指定 --yes，忽略版本警告继续执行"
+            else
+                local __ans=""
+                vps_read_tty __ans "是否继续执行？(y/N): "
+                if [[ ! "$__ans" =~ ^[Yy]$ ]]; then
+                    exit 1
+                fi
             fi
         fi
     else
@@ -196,7 +359,11 @@ configure_ssh() {
     fi
     
     # 测试 SSH 配置
-    if sshd -t; then
+    local __sshd=""
+    __sshd="$(vps_sshd_bin)"
+    if [[ -z "$__sshd" ]]; then
+        print_warning "未找到 sshd 可执行文件，跳过配置语法检查"
+    elif "$__sshd" -t; then
         print_info "SSH 配置语法检查通过"
     else
         print_error "SSH 配置语法错误，请检查"
@@ -599,81 +766,93 @@ main() {
     check_command "时区设置"
     
     # 获取用户输入 - SSH 端口
-    while true; do
-        printf "${GREEN}请输入自定义 SSH 端口号 (1024-65535，建议使用 10000-65535):${NC} "
-        read -r SSH_PORT
-        
-        # 输入验证
-        if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1024 ] && [ "$SSH_PORT" -le 65535 ]; then
-            # 检查端口是否被占用
-            if netstat -tuln 2>/dev/null | grep -q ":$SSH_PORT " || ss -tuln 2>/dev/null | grep -q ":$SSH_PORT "; then
-                print_warning "端口 $SSH_PORT 可能已被占用，请选择其他端口"
-                continue
-            fi
-            print_info "SSH 端口设置为: $SSH_PORT"
-            break
-        else
-            print_error "无效的端口号，请输入 1024-65535 之间的数字"
+    if [[ -n "$VPS_SSH_PORT" ]]; then
+        # 非交互：由 --ssh-port / VPS_SSH_PORT 指定
+        if [[ ! "$VPS_SSH_PORT" =~ ^[0-9]+$ ]] || [ "$VPS_SSH_PORT" -lt 1024 ] || [ "$VPS_SSH_PORT" -gt 65535 ]; then
+            print_error "--ssh-port 无效：$VPS_SSH_PORT（需为 1024-65535 之间的数字）"
+            exit 1
         fi
-    done
+        # 端口占用检查。注意：如果占用者就是 sshd 自己（重跑场景），不算冲突。
+        local __occ=""
+        if command -v ss >/dev/null 2>&1; then
+            __occ="$(ss -ltnp 2>/dev/null | awk -v p="$VPS_SSH_PORT" '$4 ~ "[.:]"p"$"' || true)"
+        elif command -v netstat >/dev/null 2>&1; then
+            __occ="$(netstat -tulnp 2>/dev/null | awk -v p="$VPS_SSH_PORT" '$4 ~ "[.:]"p"$"' || true)"
+        fi
+        if [[ -n "$__occ" ]]; then
+            if printf '%s' "$__occ" | grep -qi 'sshd'; then
+                print_warning "端口 $VPS_SSH_PORT 当前由 sshd 占用（说明是重跑），按继续处理"
+            else
+                print_error "端口 $VPS_SSH_PORT 已被其他进程占用，SSH 会起不来，请换一个："
+                printf '%s\n' "$__occ"
+                exit 1
+            fi
+        fi
+        SSH_PORT="$VPS_SSH_PORT"
+        print_info "SSH 端口（非交互指定）: $SSH_PORT"
+    else
+        # 没有终端就没有输入来源。如果不拦住，下面这个 while true 会
+        # 因为「读不到值 -> 校验失败 -> 再读」而无限空转，把日志刷爆。
+        if ! vps_can_ask; then
+            print_error "需要交互输入 SSH 端口，但当前没有可用终端。"
+            print_info "请改用: vps.sh --ssh-port <端口>"
+            exit 1
+        fi
+        while true; do
+            vps_read_tty SSH_PORT "${GREEN}请输入自定义 SSH 端口号 (1024-65535，建议使用 10000-65535):${NC} "
+            
+            # 输入验证
+            if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1024 ] && [ "$SSH_PORT" -le 65535 ]; then
+                # 检查端口是否被占用
+                if netstat -tuln 2>/dev/null | grep -q ":$SSH_PORT " || ss -tuln 2>/dev/null | grep -q ":$SSH_PORT "; then
+                    print_warning "端口 $SSH_PORT 可能已被占用，请选择其他端口"
+                    continue
+                fi
+                print_info "SSH 端口设置为: $SSH_PORT"
+                break
+            else
+                print_error "无效的端口号，请输入 1024-65535 之间的数字"
+            fi
+        done
+    fi
     
     # 获取用户输入 - SSH 公钥
-    while true; do
-        printf "${GREEN}请输入您的 SSH 公钥:${NC} "
-        read -r SSH_PUBLIC_KEY
-        
-        # 增强验证：检查SSH公钥格式
-        if [[ -n "$SSH_PUBLIC_KEY" ]] && [[ "$SSH_PUBLIC_KEY" =~ ^ssh-(rsa|dss|ecdsa|ed25519)[[:space:]]+[A-Za-z0-9+/]+=*[[:space:]]*.*$ ]]; then
-            # 检查公钥长度（根据密钥类型调整长度验证）
-            local key_length=${#SSH_PUBLIC_KEY}
-            local key_type=$(echo "$SSH_PUBLIC_KEY" | awk '{print $1}')
-            
-            # 根据密钥类型验证长度
-            case "$key_type" in
-                "ssh-ed25519")
-                    # ed25519 密钥较短，通常 68-120 字符
-                    if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 200 ]; then
-                        print_info "SSH ed25519 公钥验证通过"
-                        break
-                    else
-                        print_error "SSH ed25519 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
-                    fi
-                    ;;
-                "ssh-rsa")
-                    # RSA 密钥较长，通常 300-800 字符
-                    if [ "$key_length" -gt 200 ] && [ "$key_length" -lt 1000 ]; then
-                        print_info "SSH RSA 公钥验证通过"
-                        break
-                    else
-                        print_error "SSH RSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
-                    fi
-                    ;;
-                "ssh-ecdsa")
-                    # ECDSA 密钥中等长度，通常 150-300 字符
-                    if [ "$key_length" -gt 100 ] && [ "$key_length" -lt 500 ]; then
-                        print_info "SSH ECDSA 公钥验证通过"
-                        break
-                    else
-                        print_error "SSH ECDSA 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
-                    fi
-                    ;;
-                *)
-                    # 其他类型或通用验证
-                    if [ "$key_length" -gt 50 ] && [ "$key_length" -lt 1000 ]; then
-                        print_info "SSH 公钥验证通过"
-                        break
-                    else
-                        print_error "SSH 公钥长度异常 ($key_length 字符)，请检查公钥完整性"
-                    fi
-                    ;;
-            esac
+    if [[ -z "$VPS_SSH_PUBLIC_KEY" && -n "$VPS_SSH_KEY_FILE" ]]; then
+        if [[ -r "$VPS_SSH_KEY_FILE" ]]; then
+            VPS_SSH_PUBLIC_KEY="$(cat "$VPS_SSH_KEY_FILE")"
+            print_info "已从文件读取 SSH 公钥：$VPS_SSH_KEY_FILE"
         else
-            print_error "SSH 公钥格式无效，公钥应该以 'ssh-rsa', 'ssh-ed25519', 'ssh-ecdsa' 等开头"
-            print_info "示例 RSA: ssh-rsa AAAAB3NzaC1yc2EAAAA... user@host"
-            print_info "示例 Ed25519: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
-            print_info "示例 ECDSA: ssh-ecdsa AAAAE2VjZHNhLXNoYTItbmlzdHA... user@host"
+            print_error "公钥文件不存在或不可读：$VPS_SSH_KEY_FILE"
+            exit 1
         fi
-    done
+    fi
+    
+    if [[ -n "$VPS_SSH_PUBLIC_KEY" ]]; then
+        SSH_PUBLIC_KEY="$VPS_SSH_PUBLIC_KEY"
+        if ! vps_pubkey_valid "$SSH_PUBLIC_KEY"; then
+            print_error "非交互指定的 SSH 公钥未通过校验，已中止（避免写错公钥把你锁在门外）"
+            exit 1
+        fi
+        print_info "SSH 公钥（非交互指定）校验通过"
+    else
+        # 同上：没有终端就没有输入来源，必须拦住，否则 while true 会空转
+        if ! vps_can_ask; then
+            print_error "需要交互输入 SSH 公钥，但当前没有可用终端。"
+            print_info "请改用: vps.sh --ssh-key '<公钥>' 或 vps.sh --ssh-key-file <路径>"
+            exit 1
+        fi
+        while true; do
+            vps_read_tty SSH_PUBLIC_KEY "${GREEN}请输入您的 SSH 公钥:${NC} "
+            
+            if vps_pubkey_valid "$SSH_PUBLIC_KEY"; then
+                break
+            else
+                print_info "示例 RSA: ssh-rsa AAAAB3NzaC1yc2EAAAA... user@host"
+                print_info "示例 Ed25519: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host"
+                print_info "示例 ECDSA: ssh-ecdsa AAAAE2VjZHNhLXNoYTItbmlzdHA... user@host"
+            fi
+        done
+    fi
     
     # 配置 SSH
     configure_ssh "$SSH_PORT" "$SSH_PUBLIC_KEY"
@@ -727,14 +906,24 @@ main() {
     echo "总日志目录: $(du -sh /var/log 2>/dev/null | cut -f1 || echo '未知')"
     
     print_info "脚本执行完成！建议重启系统以确保所有配置生效。"
-    read -p "是否立即重启系统？(y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        print_info "系统将在 10 秒后重启..."
+    if [[ "$VPS_FORCE_REBOOT" == "1" ]]; then
+        print_info "已指定 --reboot，系统将在 10 秒后重启..."
         sleep 10
         reboot
+    elif [[ "$VPS_NO_REBOOT" == "1" ]]; then
+        # deploy-a.sh / deploy-b.sh 走这条分支：绝不能在这里重启，
+        # 否则后面的 Xray 部署步骤会被直接打断。
+        print_info "已跳过重启（--no-reboot）。请稍后手动执行: sudo reboot"
     else
-        print_info "请稍后手动重启系统: sudo reboot"
+        local __ans=""
+        vps_read_tty __ans "是否立即重启系统？(y/N): "
+        if [[ "$__ans" =~ ^[Yy]$ ]]; then
+            print_info "系统将在 10 秒后重启..."
+            sleep 10
+            reboot
+        else
+            print_info "请稍后手动重启系统: sudo reboot"
+        fi
     fi
 }
 
