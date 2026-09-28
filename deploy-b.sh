@@ -742,7 +742,23 @@ else
 fi
 hr
 printf '出口 IP 自检（应与本机公网 IP 一致）：\n'
-curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null | sed 's/^/    /' || printf '    （无法访问外网，请手动检查）\n'
+B_PUB_IP="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+if [[ -n "$B_PUB_IP" ]]; then printf '    %s\n' "$B_PUB_IP"; else printf '    （无法访问外网，请手动检查）\n'; fi
+echo
+printf '%s【下次连这台机器】把下面这段追加到 ~/.ssh/config%s\n' "$C_B" "$C_0"
+printf '%s  为什么要加：SSH 客户端默认会逐个尝试本地所有私钥，服务器对每一次尝试%s\n' "$C_D" "$C_0"
+printf '%s  都记一条 Failed publickey 并计入 fail2ban。密钥一多，连一次就可能把%s\n' "$C_D" "$C_0"
+printf '%s  自己的出口 IP 封掉。IdentitiesOnly 让它只发下面这一把。%s\n' "$C_D" "$C_0"
+echo
+printf '  Host vps-b\n'
+printf '      HostName %s\n' "${B_PUB_IP:-<落地机公网IP>}"
+printf '      Port %s\n' "$SSH_PORT"
+printf '      User root\n'
+printf '      IdentitiesOnly yes\n'
+printf '      IdentityFile ~/.ssh/keys/vps-b\n'
+echo
+printf '%s  然后把私钥放到 ~/.ssh/keys/vps-b（权限 600），之后直接：ssh vps-b%s\n' "$C_D" "$C_0"
+printf '%s  想自动化：本仓库 tools/ssh-host-add.sh 一条命令就能配好（幂等）。%s\n' "$C_D" "$C_0"
 echo
 printf '%s换 IP 后无需任何操作%s：隧道由落地机主动外拨到中转机的域名，断线会自动重连。\n' "$C_B" "$C_0"
 printf '如需手动验证重连：systemctl restart xray 后 30 秒内重跑本脚本查看第 2 项。\n'

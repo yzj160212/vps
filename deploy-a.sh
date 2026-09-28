@@ -92,7 +92,7 @@ deploy-a.sh v2.0.0 — 中转机（A）一键部署（开荒 + 反向隧道入�
 第 2 步：入口端选项
   --domain <域名或IP>    中转机（A）的公网地址 —— 客户端就是连这个。两种填法：
                            填域名：如 a.你的域名.com（需先加一条 A 记录指向中转机的 IP）
-                           填 IP  ：如 203.0.113.10（最省事，不用配 DNS）
+                           填 IP  ：如 1.2.3.4（最省事，不用配 DNS）
                          不填会自动探测中转机的公网 IP（可用，但域名更抗封锁）。
                          不需要证书、不需要是个真网站。
                          ⚠️ 别和 --sni 搞混：--sni 才是「伪装成哪个网站」。
@@ -1063,6 +1063,21 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   printf '  ss -ltnp | grep -E ":%s|:%s"       # 两个端口都在监听\n' "$ENTRY_PORT" "$REVERSE_PORT"
   printf '  journalctl -u xray -n 50 --no-pager            # 看是否有报错\n'
 fi
+echo
+printf '%s【下次连这台机器】把下面这段追加到 ~/.ssh/config%s\n' "$C_B" "$C_0"
+printf '%s  为什么要加：SSH 客户端默认会逐个尝试本地所有私钥，服务器对每一次尝试%s\n' "$C_D" "$C_0"
+printf '%s  都记一条 Failed publickey 并计入 fail2ban。密钥一多，连一次就可能把%s\n' "$C_D" "$C_0"
+printf '%s  自己的出口 IP 封掉。IdentitiesOnly 让它只发下面这一把。%s\n' "$C_D" "$C_0"
+echo
+printf '  Host vps-a\n'
+printf '      HostName %s\n' "$A_ADDR"
+printf '      Port %s\n' "$SSH_PORT"
+printf '      User root\n'
+printf '      IdentitiesOnly yes\n'
+printf '      IdentityFile ~/.ssh/keys/vps-a\n'
+echo
+printf '%s  然后把私钥放到 ~/.ssh/keys/vps-a（权限 600），之后直接：ssh vps-a%s\n' "$C_D" "$C_0"
+printf '%s  想自动化：本仓库 tools/ssh-host-add.sh 一条命令就能配好（幂等）。%s\n' "$C_D" "$C_0"
 echo
 printf '%s注意%s：中转机侧配置与防火墙%s不依赖落地机的 IP%s，落地机换 IP 无需任何改动。\n' "$C_Y" "$C_0" "$C_Y" "$C_0"
 hr
