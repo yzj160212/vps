@@ -56,6 +56,21 @@ VPS_NO_REBOOT="${VPS_NO_REBOOT:-0}"
 VPS_FORCE_REBOOT="${VPS_FORCE_REBOOT:-0}"
 VPS_SKIP_DEBIAN_CHECK="${VPS_SKIP_DEBIAN_CHECK:-0}"
 
+# ============================================================================
+# 配置文件下载地址
+# ----------------------------------------------------------------------------
+# sshd_config / jail.local 从本仓库 raw 地址下载。
+# 好处：只改仓库里的配置文件就能给所有已分发的 vps.sh 打补丁，不必改脚本。
+# ============================================================================
+VPS_RAW="${VPS_RAW:-https://raw.githubusercontent.com/yzj160212/vps/main}"
+
+# 管理员 IP：会被写进 fail2ban 的 ignoreip，永不封禁。
+# 为什么需要：本脚本禁用了密码登录 + 开启 aggressive 模式的 fail2ban，
+#   任何一次「未完成密钥认证的断开」都会计为失败。管理员自己调试时
+#   很容易在 3 次之内把自己的出口 IP 封掉（实测踩过：整个局域网被锁死）。
+# 留空则不加。可用 --admin-ip 传入，也可用 VPS_ADMIN_IP 环境变量。
+VPS_ADMIN_IP="${VPS_ADMIN_IP:-}"
+
 # 从终端读一行。
 # 为什么不用裸 read：`curl ... | bash` 时 bash 自己正在从 stdin 读脚本，
 # 如果脚本里的 read 也去读 stdin，会把还没执行的脚本文本吃掉 —— 灾难。
@@ -166,6 +181,7 @@ vps.sh — Debian 12 VPS 开荒脚本（SSH 加固 + fail2ban + UFW + 日志优�
   --ssh-port <端口>      直接指定 SSH 端口，跳过交互提问（1024-65535）
   --ssh-key <公钥串>     直接指定 SSH 公钥，跳过交互提问
   --ssh-key-file <路径>  从文件读取 SSH 公钥
+  --admin-ip <IP>        把该 IP 加入 fail2ban 白名单（永不封禁），强烈建议填
   --yes                  所有确认一律回答「是」（无人值守）
   --no-reboot            结束时不要重启（deploy-*.sh 默认使用，避免打断后续步骤）
   --reboot               结束时强制重启
@@ -173,7 +189,7 @@ vps.sh — Debian 12 VPS 开荒脚本（SSH 加固 + fail2ban + UFW + 日志优�
   -h, --help             显示本帮助
 
 对应环境变量：
-  VPS_SSH_PORT  VPS_SSH_PUBLIC_KEY  VPS_SSH_KEY_FILE
+  VPS_SSH_PORT  VPS_SSH_PUBLIC_KEY  VPS_SSH_KEY_FILE  VPS_ADMIN_IP
   VPS_ASSUME_YES=1  VPS_NO_REBOOT=1  VPS_FORCE_REBOOT=1  VPS_SKIP_DEBIAN_CHECK=1
 EOF
 }
@@ -184,6 +200,7 @@ while [[ $# -gt 0 ]]; do
         --ssh-port)          VPS_SSH_PORT="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
         --ssh-key)           VPS_SSH_PUBLIC_KEY="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
         --ssh-key-file)      VPS_SSH_KEY_FILE="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
+        --admin-ip)          VPS_ADMIN_IP="${2:-}"; shift; [[ $# -gt 0 ]] && shift || true ;;
         --yes|-y)            VPS_ASSUME_YES=1; shift ;;
         --no-reboot)         VPS_NO_REBOOT=1; shift ;;
         --reboot)            VPS_FORCE_REBOOT=1; VPS_NO_REBOOT=0; shift ;;
@@ -309,10 +326,10 @@ configure_ssh() {
     print_info "SSH 配置已备份到: $backup_file"
     
     # 下载 SSH 配置文件
-    if wget -O /etc/ssh/sshd_config https://raw.githubusercontent.com/yzj160212/vps/main/sshd_config; then
+    if wget -O /etc/ssh/sshd_config "$VPS_RAW/sshd_config"; then
         print_info "SSH 配置文件下载成功"
     else
-        print_warning "SSH 配置文件下载失败，使用默认配置"
+        print_warning "SSH 配置文件下载失败，使用内置兜底配置"
         # 如果下载失败，恢复备份并手动配置关键选项
         cp "$backup_file" /etc/ssh/sshd_config
         
@@ -322,6 +339,15 @@ configure_ssh() {
         sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
         # 降低日志级别以减少日志量（低配置VPS优化）
         sed -i 's/^#*LogLevel.*/LogLevel INFO/' /etc/ssh/sshd_config
+
+        # ⚠️ 必须把 MaxStartups 放宽。
+        #    仓库里的 sshd_config 用的是 MaxStartups 10:30:60；如果下载失败退回
+        #    Debian 默认值也是 10:30:100，都没问题。但如果系统上残留了过窄的值
+        #    （例如 5:30:10），公网 IP 被扫描时会频繁触发「超限即直接断连」，
+        #    表现为「TCP 能连上、但拿不到 SSH banner」，极难排查。
+        sed -i 's/^[[:space:]]*MaxStartups.*/MaxStartups 10:30:60/' /etc/ssh/sshd_config
+        grep -qE '^[[:space:]]*MaxStartups' /etc/ssh/sshd_config || \
+            echo "MaxStartups 10:30:60" >> /etc/ssh/sshd_config
     fi
     
     # 修改 SSH 端口
@@ -408,6 +434,44 @@ set_fail2ban_port() {
         { print }
     ' "$f" > "$tmp" && mv "$tmp" "$f"
     grep -qE "^[[:space:]]*port[[:space:]]*=[[:space:]]*${port}[[:space:]]*$" "$f"
+}
+
+# 函数：把管理员 IP 追加进 fail2ban 的 ignoreip（幂等）
+# 为什么必须做：本套配置禁用了密码登录，fail2ban 又开了 aggressive 模式，
+#   任何一次「未完成密钥认证的断开」都算失败。管理员自己调试（比如换了台机器、
+#   密钥没加载、用 BatchMode 探测）很容易在 3 次之内把自己的出口 IP 封掉。
+#   实测踩过：把整个局域网的出口 IP 封了 7 天，只能重装系统才能救回来。
+add_fail2ban_ignoreip() {
+    local ip="$1" f="${2:-/etc/fail2ban/jail.local}" tmp
+    [ -n "$ip" ] || return 0
+    [ -f "$f" ] || return 1
+
+    if awk -v ip="$ip" '
+        /^[[:space:]]*\[/ { in_def = ($0 ~ /^[[:space:]]*\[DEFAULT\]/) }
+        in_def && /^[[:space:]]*ignoreip[[:space:]]*=/ {
+            n = split($0, a, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) if (a[i] == ip) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$f"; then
+        print_info "  管理员 IP ${ip} 已在 fail2ban 白名单中，跳过"
+        return 0
+    fi
+
+    tmp="$(mktemp)"
+    awk -v ip="$ip" '
+        /^[[:space:]]*\[/ { in_def = ($0 ~ /^[[:space:]]*\[DEFAULT\]/) }
+        in_def && /^[[:space:]]*ignoreip[[:space:]]*=/ { print $0 " " ip; seen = 1; next }
+        { print }
+        END { if (!seen) print "ignoreip = 127.0.0.1/8 ::1 " ip }
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+
+    if grep -qF "$ip" "$f"; then
+        print_info "  已把管理员 IP ${ip} 加入 fail2ban 白名单（永不封禁）"
+        return 0
+    fi
+    print_warning "  管理员 IP ${ip} 写入 fail2ban 白名单失败"
+    return 1
 }
 
 # 函数：fail2ban 部署后自检
@@ -511,26 +575,30 @@ EOF
     logger -p auth.info "fail2ban setup: SSH service configured"
     
     # 创建备用配置的函数
+    # ⚠️ 这里的兜底配置必须和仓库里的 jail.local 保持同一套关键参数，否则一旦
+    #    下载失败就会静默退化成一个「看着正常、实际毫无保护」的配置：
+    #      · filter 必须写 sshd[mode=aggressive]（单独一行 mode = ... 是无效的）
+    #      · backend 必须用 systemd（file 后端在 Debian 12 上常常读不到日志）
+    #      · bantime 不能太长：7 天会把管理员自己锁死，1 小时足够起到威慑作用
     create_fallback_config() {
         cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
-bantime = 86400
+bantime = 3600
 findtime = 600
 maxretry = 5
 backend = systemd
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 
 [sshd]
 enabled = true
 port = $ssh_port
-filter = sshd
-logpath = /var/log/auth.log
+filter = sshd[mode=aggressive]
 maxretry = 5
 EOF
     }
     
     # 下载你的自定义配置文件
-    if wget -O /etc/fail2ban/jail.local https://raw.githubusercontent.com/yzj160212/vps/main/jail.local; then
+    if wget -O /etc/fail2ban/jail.local "$VPS_RAW/jail.local"; then
         print_info "fail2ban 配置文件下载成功"
         
         # 修改配置文件中的 SSH 端口
@@ -552,6 +620,24 @@ EOF
     else
         print_warning "fail2ban 配置文件下载失败，使用基础配置"
         create_fallback_config
+    fi
+
+    # ------------------------------------------------------------------
+    # 白名单：把管理员自己的出口 IP 排除在封禁之外
+    # ------------------------------------------------------------------
+    # 优先用 --admin-ip 显式指定的；没指定就尝试从当前 SSH 会话推断
+    # （SSH_CLIENT="<客户端IP> <客户端端口> <服务端端口>"）。
+    # 注意：出口 IP 可能会变（换代理节点、换网络），变了就要重新加一次。
+    local __admin_ip="$VPS_ADMIN_IP"
+    if [ -z "$__admin_ip" ] && [ -n "${SSH_CLIENT:-}" ]; then
+        __admin_ip="$(printf '%s' "$SSH_CLIENT" | awk '{print $1}')"
+        [ -n "$__admin_ip" ] && print_info "  从当前 SSH 会话推断管理员 IP：$__admin_ip"
+    fi
+    if [ -n "$__admin_ip" ]; then
+        add_fail2ban_ignoreip "$__admin_ip" || true
+    else
+        print_warning "  未提供管理员 IP（--admin-ip），fail2ban 白名单里只有内网段。"
+        print_warning "  提醒：连续 5 次认证失败会封禁 1 小时，请务必确认密钥可用。"
     fi
     
     # 设置 IPv6 支持。
