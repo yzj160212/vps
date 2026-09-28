@@ -97,11 +97,15 @@ deploy-a.sh v2.0.0 — 服务器 A 一键部署（开荒 + 反向隧道入口端
   --port <端口>          用户入口端口，默认 443（建议保持 443，见 README）
   --reverse-port <端口>  B 反向隧道落点端口。不填则自动在 20000-60000 里随机挑一个
   --nodes <数量>         节点数量，默认 1（生成 node1..nodeN，各自独立 UUID）
-  --sni <域名>           REALITY 伪装的「回落域名」，默认 www.microsoft.com。
-                         必须是一个支持 TLS 1.3 的真实大站 —— 客户端会把自己的
-                         TLS 特征伪装成访问这个站。和 --domain 完全无关。
+  --sni <域名>           REALITY 伪装的「回落域名」，默认 www.apple.com。
+                         必须是支持 TLS 1.3 + X25519 的真实大站。
+                         ⚠️ 不要照抄教程里的域名！实测 www.microsoft.com 会让
+                         REALITY 握手失败（而表面上一切正常，客户端只报连不上）。
+                         部署完会自动做一次 REALITY 自检，失败会提示换域名。
+                         和 --domain 完全无关（--domain 是「客户端连哪」）。
   --path <路径>          XHTTP path，默认自动生成随机路径
   --pq                   使用 ML-KEM-768 后量子 VLESS Encryption（默认 X25519）
+  --skip-sni-check       跳过部署后的 REALITY 自检（不推荐）
   --dry-run              只生成并校验配置、打印令牌，不改动系统（无需 root，且会跳过开荒）
   --force                已存在配置时强制覆盖（会先备份）
   --skip-firewall        不改动防火墙
