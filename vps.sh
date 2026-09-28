@@ -77,15 +77,21 @@ VPS_ADMIN_IP="${VPS_ADMIN_IP:-}"
 # 所以 stdin 不是终端时，一律改从 /dev/tty 读。
 vps_read_tty() {
     local __var="$1" __prompt="$2" __val=""
+    # ⚠️ 必须用 %b 而不是 %s。
+    #    提示语里带颜色码（$GREEN / $NC 的值是字面量 "\033[0;32m" 这种反斜杠转义），
+    #    而 printf '%s' 不解析反斜杠转义，会把 "\033[0;32m" 原样打印到终端上，
+    #    用户看到的就是一串乱码般的 "\033[0;32m请输入...\033[0m"。%b 才会解析。
+    #    注意：下面回写变量的那句必须保持 %s —— 用户输入的内容里若含反斜杠，
+    #    绝不能被解释成转义。
     if [[ -t 0 ]]; then
-        printf '%s' "$__prompt" >&2
+        printf '%b' "$__prompt" >&2
         IFS= read -r __val || __val=""
     elif [[ -r /dev/tty ]]; then
-        printf '%s' "$__prompt" >&2
+        printf '%b' "$__prompt" >&2
         IFS= read -r __val < /dev/tty || __val=""
     else
         # 既没有终端也没有 stdin —— 交给调用方按默认值处理
-        printf '%s' "$__prompt" >&2
+        printf '%b' "$__prompt" >&2
         __val=""
     fi
     printf -v "$__var" '%s' "$__val"

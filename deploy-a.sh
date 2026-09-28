@@ -297,14 +297,16 @@ pubkey_parsable() {
 
 # 从终端确认。0=同意，1=不同意或无法询问。
 # 优先读 /dev/tty：`curl ... | bash` 时 stdin 是脚本文本本身，绝不能去读它。
+# 提示语用 printf '%b' 输出：%s 不解析反斜杠转义，一旦 prompt 里带颜色码
+# （如 "$GREEN...$NC"），终端上就会原样显示 "\033[0;32m" 这种乱码。
 ask_confirm() {
   local prompt="$1" ans=""
   if [[ "$BOOTSTRAP_YES" -eq 1 ]]; then return 0; fi
   if [[ -t 0 ]]; then
-    printf '%s' "$prompt" >&2
+    printf '%b' "$prompt" >&2
     IFS= read -r ans || ans=""
   elif [[ -r /dev/tty ]]; then
-    printf '%s' "$prompt" >&2
+    printf '%b' "$prompt" >&2
     IFS= read -r ans < /dev/tty || ans=""
   else
     return 1
