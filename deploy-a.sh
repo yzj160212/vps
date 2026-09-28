@@ -87,11 +87,18 @@ deploy-a.sh v2.0.0 — 服务器 A 一键部署（开荒 + 反向隧道入口端
   --vps-sh <路径>        指定本地 vps.sh 路径（默认自动查找，找不到就从仓库下载）
 
 第 2 步：入口端选项
-  --domain <域名或IP>    A 的公网域名（推荐）或公网 IP，用于生成客户端分享链接
+  --domain <域名或IP>    A 的公网地址 —— 客户端就是连这个。两种填法：
+                           填域名：如 a.你的域名.com（需先加一条 A 记录指向 A 的 IP）
+                           填 IP  ：如 203.0.113.10（最省事，不用配 DNS）
+                         不填会自动探测 A 的公网 IP（可用，但域名更抗封锁）。
+                         不需要证书、不需要是个真网站。
+                         ⚠️ 别和 --sni 搞混：--sni 才是「伪装成哪个网站」。
   --port <端口>          用户入口端口，默认 443（建议保持 443，见 README）
   --reverse-port <端口>  B 反向隧道落点端口。不填则自动在 20000-60000 里随机挑一个
   --nodes <数量>         节点数量，默认 1（生成 node1..nodeN，各自独立 UUID）
-  --sni <域名>           REALITY 回落域名，默认 www.microsoft.com
+  --sni <域名>           REALITY 伪装的「回落域名」，默认 www.microsoft.com。
+                         必须是一个支持 TLS 1.3 的真实大站 —— 客户端会把自己的
+                         TLS 特征伪装成访问这个站。和 --domain 完全无关。
   --path <路径>          XHTTP path，默认自动生成随机路径
   --pq                   使用 ML-KEM-768 后量子 VLESS Encryption（默认 X25519）
   --dry-run              只生成并校验配置、打印令牌，不改动系统（无需 root，且会跳过开荒）
@@ -583,6 +590,57 @@ detect_public_ip() {
   return 1
 }
 
+# ============================ --domain 可达性检查 ============================
+# --domain 会原样写进分享链接的 @host:port，是客户端唯一要连的地址。
+# 填错（打错字 / DNS 没配 / 挂在 Cloudflare 代理后面）客户端就连不上，
+# 而那时候你只看到「连不上」，很难想到是这里的问题。
+# 所以提前查一次 —— 只警告，不中断，避免误伤合法但少见的部署方式。
+check_a_addr_reachable() {
+  local addr="$1" resolved="" myip=""
+
+  # 纯 IP：跟本机公网 IP 比一下，不一致通常是 NAT / 弹性 IP
+  if [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$addr" == *:* ]]; then
+    myip="$(detect_public_ip || true)"
+    if [[ -n "$myip" && "$myip" != "$addr" ]]; then
+      warn "你指定的 --domain ${addr} 和本机探测到的公网 IP ${myip} 不一致。"
+      warn "如果 A 不是走 NAT/弹性 IP，客户端会连不上 —— 请确认一下。"
+    fi
+    return 0
+  fi
+
+  # 域名：看能不能解析
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahostsv4 "$addr" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)"
+  elif command -v dig >/dev/null 2>&1; then
+    resolved="$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9]' | tr '\n' ' ' | sed 's/ *$//' || true)"
+  elif command -v host >/dev/null 2>&1; then
+    resolved="$(host -t A "$addr" 2>/dev/null | awk '/has address/{print $4}' | tr '\n' ' ' | sed 's/ *$//' || true)"
+  else
+    info "系统里没有 getent/dig/host，跳过 --domain 解析检查"
+    return 0
+  fi
+
+  if [[ -z "$resolved" ]]; then
+    warn "无法解析 --domain ${addr} —— 这个域名现在指向不到任何地址，客户端会连不上。"
+    warn "请先加一条 A 记录指向 A 的公网 IP，例如："
+    warn "    ${addr}  A  <A的公网IP>"
+    warn "想跳过域名直接跑，也可以改用公网 IP：--domain <A的公网IP>"
+    return 0
+  fi
+
+  info "--domain ${addr} 解析到：${resolved}"
+
+  myip="$(detect_public_ip || true)"
+  if [[ -n "$myip" ]] && ! printf ' %s ' "$resolved" | grep -qw "$myip"; then
+    warn "--domain ${addr} 解析到 ${resolved}，但本机公网 IP 是 ${myip}，两者不一致。"
+    warn "常见原因："
+    warn "  1. DNS 还没生效 / A 记录写错了 IP"
+    warn "  2. 域名挂在 Cloudflare 代理后面（橙云）—— REALITY 必须直连，请改成「仅 DNS」（灰云）"
+    warn "确认无误可以忽略本警告。"
+  fi
+  return 0
+}
+
 # ============================ 配置写入 ============================
 test_xray_config() {
   local f="$1" out=""
@@ -738,6 +796,10 @@ if [[ -z "$A_ADDR" ]]; then
   A_ADDR="$(detect_public_ip || true)"
   [[ -n "$A_ADDR" ]] || die "无法自动探测公网 IP，请用 --domain 指定"
   warn "未指定 --domain，自动使用公网 IP：$A_ADDR（建议改用域名）"
+else
+  # --domain 就是「客户端要连的地址」，会原样写进分享链接的 @host:port。
+  # 填错了客户端根本连不上，所以这里做一次只警告不致命的可达性检查。
+  check_a_addr_reachable "$A_ADDR"
 fi
 
 # 组装 clients / users 片段
