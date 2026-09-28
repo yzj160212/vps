@@ -38,7 +38,7 @@
 ### 第 1 步 · 中转机（A）
 
 ```bash
-bash <(curl -fsSL vps-yy.vercel.app/a) --domain 你的A的IP或域名
+bash <(curl -fsSL vps-yy.vercel.app/a) --domain 你的中转机的IP或域名
 ```
 
 `--domain` 填什么：
@@ -46,20 +46,26 @@ bash <(curl -fsSL vps-yy.vercel.app/a) --domain 你的A的IP或域名
 - **有域名**：填 `a.你的域名.com`（先去域名商加一条 **A 记录**指向中转机的公网 IP）
 - **没域名**：直接填 **中转机的公网 IP**（最简单，不用配任何东西）
 
-跑完会打印**一行令牌**，形如：
+跑完会打印**一条可以直接复制的命令**，形如：
 
 ```
-【第 2 步】在落地机（B）上执行（复制整行，含长令牌）
-  bash deploy-b.sh --token WFJBWV9SRVZFUlNFX0VOUk9MTF9WMQpBX0FERFI9...
+【第 2 步】在落地机（B）上执行下面这一整行
+  从「bash」开始、到行尾为止，整行复制（不要只复制后面的令牌）
+
+  bash <(curl -fsSL https://vps-yy.vercel.app/b) --token WFJBWV9SRVZFUlNFX0VOUk9MTF9WMQpBX0FERFI9...
 ```
 
 ### 第 2 步 · 落地机（B）
 
-把上面那行**原样复制**到落地机上执行：
+**把上面那一整行原样复制**到落地机执行即可。
 
-```bash
-bash <(curl -fsSL vps-yy.vercel.app/b) --token WFJBWV9SRVZFUlNFX0VOUk9MTF9WMQpBX0FERFI9...
-```
+> **为什么要复制整行？**
+> 令牌只是这条命令的**最后一个参数**。前面那截 `bash <(curl -fsSL .../b)`
+> 的意思是「去网上把 deploy-b.sh 取下来执行」，少了它就没有命令可跑。
+> 只复制令牌是跑不起来的。
+>
+> 如果落地机上已经有 `deploy-b.sh` 文件，也可以直接执行：
+> `bash deploy-b.sh --token <上面那串令牌>`
 
 ### 第 3 步 · 客户端
 

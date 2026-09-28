@@ -34,6 +34,8 @@ SKIP_BOOTSTRAP=0             # 1 = 跳过开荒，只部署 Xray
 KEEP_SSH_PORT=0              # 1 = 不改动 SSH 端口
 BOOTSTRAP_YES=0              # 1 = 开荒阶段不再交互确认
 BOOTSTRAP_MARKER="/etc/xray-reverse/bootstrap.done"   # 开荒完成标记（用于识别重跑）
+DEPLOY_B_URL="https://vps-yy.vercel.app/b"      # 交付给落地机的一键命令地址
+                                             # （换域名/换仓库时改这里，输出的命令会跟着变）
 
 # ============================ 默认参数（第 2 步，入口端）============================
 ENTRY_PORT=443                    # 用户入口端口
@@ -1037,9 +1039,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   cat "$XRAY_CONF"
   echo
 fi
-printf '%s【第 2 步】在落地机（B）上执行（复制整行，含长令牌）%s\n' "$C_B" "$C_0"
+printf '%s【第 2 步】在落地机（B）上执行下面这一整行%s\n' "$C_B" "$C_0"
+printf '%s  从「bash」开始、到行尾为止，整行复制（不要只复制后面的令牌）%s\n' "$C_D" "$C_0"
 echo
-printf '  bash deploy-b.sh --token %s\n' "$TOKEN"
+printf '  bash <(curl -fsSL %s) --token %s\n' "$DEPLOY_B_URL" "$TOKEN"
+echo
+printf '%s  若落地机上已经有 deploy-b.sh 文件，也可以直接执行：%s\n' "$C_D" "$C_0"
+printf '%s      bash deploy-b.sh --token <上面那串令牌>%s\n' "$C_D" "$C_0"
 echo
 printf '%s【客户端分享链接】%s\n' "$C_B" "$C_0"
 cat "$LINKS_FILE"
